@@ -1,0 +1,31 @@
+# Normalize all text to LF in the repository.
+#
+# This project deploys shell scripts and a systemd-driven kiosk to a Linux
+# appliance. A CRLF shebang (`#!/usr/bin/env bash\r`) or CRLF inside an install
+# heredoc will wedge the install on the device. Forcing eol=lf means a
+# contributor on Windows cannot commit CRLF that would break the appliance,
+# regardless of their local core.autocrlf setting.
+* text=auto eol=lf
+
+# Be explicit for the files that must run on the device.
+*.sh    text eol=lf
+*.py    text eol=lf
+*.html  text eol=lf
+*.css   text eol=lf
+*.js    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+
+# Binary assets — never normalize line endings.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.pdf   binary
+*.pptx  binary
+*.ppt   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary

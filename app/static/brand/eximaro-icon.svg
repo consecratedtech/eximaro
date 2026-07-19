@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Eximaro icon — ink rounded square with a sky x. Full-color app/brand mark
+     (favicon, avatar, README logo). Mono variant: eximaro-icon-mono.svg. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Eximaro">
+  <rect width="512" height="512" rx="120" fill="#17191C"/>
+  <g transform="translate(256 256)" fill="#2F7FE0">
+    <rect x="-150" y="-38" width="300" height="76" rx="38" transform="rotate(45)"/>
+    <rect x="-150" y="-38" width="300" height="76" rx="38" transform="rotate(-45)"/>
+  </g>
+</svg>

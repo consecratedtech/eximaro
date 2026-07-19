@@ -1,0 +1,578 @@
+<!doctype html>
+<!-- Copyright (C) 2026 Consecrated Tech. License: PolyForm-Noncommercial-1.0.0 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="generator" content="eximaro · emx-scr-q7v2k9x3j6">
+<title>Screen</title>
+<link rel="icon" href="/static/brand/eximaro-icon.svg">
+<link rel="stylesheet" href="/static/tokens.css">
+<link rel="stylesheet" href="/static/fonts/fonts.css">
+<style>
+  html,body{margin:0;height:100%;background:var(--d-bg,#101214);overflow:hidden;
+    font-family:"Hanken Grotesk",system-ui,sans-serif;color:var(--d-ink,#EDEFF1);
+    -webkit-font-smoothing:antialiased}
+  #stage{position:fixed;inset:0;background:#000;overflow:hidden}
+  /* Each playlist item lives in its own absolutely-stacked layer. Layers are
+     built once and kept mounted; switching items crossfades opacity so there is
+     never a black gap or a "loading" flash between items. The black stage
+     background shows through any letterboxing. */
+  #stage .layer{position:absolute;inset:0;opacity:0;transition:opacity .4s ease;background:#000}
+  #stage .layer.active{opacity:1}
+  /* Inactive layers stay rendered (opacity:0, NOT display:none) so the browser
+     does not throttle/pause their iframes. */
+  #stage .layer img{position:absolute;inset:0;width:100%;height:100%;border:0;object-fit:contain;background:#000}
+  #stage .layer iframe{position:absolute;left:0;top:0;width:100%;height:100%;border:0;background:#000}
+  #stage .layer video{position:absolute;inset:0;width:100%;height:100%;border:0;object-fit:contain;background:#000}
+  /* A Google Slides embed always renders a bottom control/branding bar that no
+     URL param can disable. Oversize the iframe so that bar falls past the bottom
+     of the (overflow:hidden) stage and is clipped away. */
+  #stage .layer iframe.slides{height:calc(100% + 60px)}
+
+  /* The eximaro wordmark, rendered as live text (never an image), sits quietly
+     in the corner of every non-playing state. It never appears over content. */
+  .wm{position:absolute;top:clamp(18px,3.4vh,34px);left:clamp(20px,3.4vw,44px);
+      font-family:"Sora",sans-serif;font-weight:600;letter-spacing:-.01em;
+      font-size:clamp(15px,1.9vw,22px);color:var(--d-ink,#EDEFF1);opacity:.9}
+  .wm .x{color:var(--d-accent,#6AB0F3)}
+
+  /* The idle / setup screen — shown only when there is nothing to play, the
+     playlist is empty, or the device is first being set up. It is the one place
+     the device's address lives; while content plays, the screen stays clean. */
+  #idle{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+        color:var(--d-muted,#9AA1A9);text-align:center;padding:24px}
+  #idle .big{font-family:"Sora",sans-serif;font-weight:600;letter-spacing:-.01em;
+        font-size:clamp(22px,3.2vw,34px);color:var(--d-ink,#EDEFF1);margin-bottom:14px}
+  #idle .hint{font-size:clamp(15px,1.7vw,20px);color:var(--d-muted,#9AA1A9);line-height:1.5}
+  #idle b,#pair .url{color:var(--d-accent,#6AB0F3);font-weight:600}
+  .qr{display:none;margin:24px auto 6px;width:min(34vmin,240px);height:auto;
+      background:#fff;padding:12px;border-radius:14px;image-rendering:pixelated}
+  .qrcap{color:var(--d-muted,#9AA1A9);font-size:clamp(12px,1.4vw,15px);letter-spacing:.04em}
+  .addrs{color:var(--d-ink,#EDEFF1);font:600 clamp(15px,1.9vw,21px)/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;
+         margin-top:12px;white-space:pre-line}
+  /* Setup mode: shown full-screen when the device has no working connection, so
+     someone can join its network and hand it real WiFi. Highest-priority state. */
+  #wifisetup{position:fixed;inset:0;display:none;align-items:center;justify-content:center;
+        text-align:center;padding:24px;background:var(--d-bg,#101214);color:var(--d-ink,#EDEFF1);z-index:20}
+  #wifisetup .big{font-family:"Sora",sans-serif;font-weight:600;letter-spacing:-.01em;
+        font-size:clamp(22px,3.2vw,34px);margin-bottom:6px}
+  #wifisetup .hint{font-size:clamp(15px,1.7vw,20px);color:var(--d-muted,#9AA1A9);line-height:1.5}
+  #wifisetup .hint b{color:var(--d-accent,#6AB0F3)}
+  /* Two QR codes, side by side: (1) join this screen's network, (2) open the page. */
+  .wifiqrs{display:flex;gap:clamp(24px,6vw,72px);justify-content:center;align-items:flex-start;
+        flex-wrap:wrap;margin-top:22px}
+  .wifiqr{display:flex;flex-direction:column;align-items:center;max-width:min(44vmin,340px)}
+  .wifistep{font-family:"Sora",sans-serif;font-weight:600;font-size:clamp(15px,1.9vw,22px);
+        color:var(--d-ink,#EDEFF1);margin-bottom:2px}
+  #wifisetup .qr{margin:8px auto;width:min(30vmin,230px)}
+  #wifisetup .wifiname{margin-top:8px;
+        font:600 clamp(13px,1.6vw,18px)/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-word}
+  #wifisetup .wifiname b{color:var(--d-accent,#6AB0F3)}
+  #wifisetup .wifitip{margin-top:26px;font-size:clamp(14px,1.6vw,19px);
+        color:var(--d-muted,#9AA1A9);line-height:1.5}
+  #wifisetup .wifitip b{color:var(--d-accent,#6AB0F3);font-weight:600}
+
+  #pair{position:fixed;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;
+        background:var(--d-bg,#101214);color:var(--d-ink,#EDEFF1);text-align:center;padding:24px;z-index:10}
+  #pair .label{color:var(--d-muted,#9AA1A9);font-size:clamp(16px,2vw,22px);margin-bottom:22px;max-width:22ch}
+  #pair .code{font:700 clamp(52px,12vw,150px)/1 "Sora",sans-serif;letter-spacing:.14em;
+        color:var(--d-accent,#6AB0F3)}
+  #pair .sub{color:var(--d-muted,#9AA1A9);font-size:clamp(14px,1.6vw,18px);margin-top:22px}
+
+  /* Boot splash: on startup, show the address (~1 min) so a freshly-rebooted
+     screen is easy to find on the network before content takes over. */
+  #boot{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+        background:var(--d-bg,#101214);color:var(--d-muted,#9AA1A9);text-align:center;padding:24px;z-index:8}
+  #boot .big{font-family:"Sora",sans-serif;font-weight:600;letter-spacing:-.01em;
+        font-size:clamp(20px,2.8vw,30px);color:var(--d-ink,#EDEFF1);margin-bottom:6px}
+  #boot .hint{font-size:clamp(13px,1.6vw,18px);color:var(--d-muted,#9AA1A9)}
+</style>
+</head>
+<body>
+  <div id="stage"></div>
+  <div id="idle">
+    <div class="wm">e<span class="x">x</span>imaro</div>
+    <div>
+      <div class="big">Waiting for content&hellip;</div>
+      <div class="hint">Open one of these on your phone or computer to set it up</div>
+      <div class="addrs" id="idleAddrs"></div>
+      <img id="qrIdle" class="qr" alt="QR code that opens this device">
+      <div class="qrcap" id="qrIdleCap" style="display:none">Scan to open</div>
+    </div>
+  </div>
+  <div id="pair">
+    <div class="wm">e<span class="x">x</span>imaro</div>
+    <div class="label">On your controller, choose &ldquo;Add a screen&rdquo; and enter this code</div>
+    <div class="code" id="pairCode"></div>
+    <img id="qrPair" class="qr" alt="QR code that opens this device">
+    <div class="sub">This code disappears in a few minutes. &middot; This screen: <span class="url" id="pairUrl"></span></div>
+  </div>
+  <div id="boot">
+    <div class="wm">e<span class="x">x</span>imaro</div>
+    <div>
+      <div class="big">Starting up&hellip;</div>
+      <div class="hint">Open one of these on your phone or computer to set it up</div>
+      <div class="addrs" id="bootAddrs"></div>
+      <img id="qrBoot" class="qr" alt="QR code that opens this device">
+      <div class="qrcap" id="qrBootCap" style="display:none">Scan to open</div>
+    </div>
+  </div>
+  <div id="wifisetup">
+    <div class="wm">e<span class="x">x</span>imaro</div>
+    <div>
+      <div class="big">Connect this screen to WiFi</div>
+      <div class="hint">On your phone: scan <b>1</b> to join this screen&rsquo;s network,
+        then <b>2</b> to open the setup page.</div>
+      <div class="wifiqrs">
+        <div class="wifiqr">
+          <div class="wifistep">1 &middot; Scan to join</div>
+          <img id="qrWifi" class="qr" alt="Scan to join this screen's setup network">
+          <div class="wifiname">Join <b id="wifiSsid"></b><br>password <b id="wifiPass"></b></div>
+        </div>
+        <div class="wifiqr">
+          <div class="wifistep">2 &middot; Scan to open</div>
+          <img id="qrWifiOpen" class="qr" alt="Scan to open this screen's WiFi setup page">
+          <div class="wifiname">or open<br><b>http://10.42.0.1:8080/wifi-setup</b></div>
+        </div>
+      </div>
+      <div class="wifitip">Page won&rsquo;t open on your phone? <b>Turn off mobile data</b>
+        for a moment so it uses this network instead of cellular.</div>
+    </div>
+  </div>
+
+  <script>
+    const stage = document.getElementById('stage');
+    const idle = document.getElementById('idle');
+    const pair = document.getElementById('pair');
+    const pairCode = document.getElementById('pairCode');
+
+    let items = [];        // playlist items, in playlist order
+    let order = [];        // play sequence (indices into items): shuffled or 0..n-1
+    let pos = 0;           // position within `order`
+    let signature = '';    // detects when the content/shuffle actually changed
+    let shuffle = false;
+    let lastUrl = '';      // current connect URL (so the QR refreshes if the IP changes)
+    let bootId = '';       // app-start token; when it changes the page reloads itself
+    let bootDone = false;  // true after the startup address splash has elapsed
+    let layers = [];       // mounted layer per item (built once, reused)
+
+    let cycleTimer = null;   // advances items, and slides WITHIN a pptx slideshow
+    let pendingSlide = null; // {iframe, timer}: a Google Slides reload still loading
+    let ytBeat = null;       // resends the YouTube API handshake until the player answers
+
+    function dur(item) { return Math.max(3, item.seconds || 10) * 1000; }
+
+    function embedSrc(u) {
+      // Google Slides '/pub' links send X-Frame-Options: SAMEORIGIN and refuse to
+      // load in an iframe; '/embed' is the frameable form. Force loop=true so the
+      // deck keeps cycling instead of parking on its (often dark) last slide.
+      u = u || '';
+      if (!/docs\.google\.com\/presentation/.test(u)) return u;
+      return u.replace('/pub', '/embed').replace(/loop=false/, 'loop=true');
+    }
+    function isSlides(u) { return /docs\.google\.com\/presentation/.test(u || ''); }
+
+    async function loadData() {
+      try {
+        const r = await fetch('/api/screen-data', { cache: 'no-store' });
+        const data = await r.json();
+
+        // The app restarted (e.g. an update installed a new screen.html) — reload
+        // the page so the display runs the new code instead of what it booted with.
+        if (data.boot) {
+          if (bootId && data.boot !== bootId) { location.reload(); return; }
+          bootId = data.boot;
+        }
+
+        // No working connection: the device is hosting its own setup network. Show
+        // the join QR + credentials full-screen, over everything, until it's online.
+        const setupEl = document.getElementById('wifisetup');
+        if (data.wifi_setup) {
+          document.getElementById('wifiSsid').textContent = data.wifi_setup.ssid;
+          document.getElementById('wifiPass').textContent = data.wifi_setup.password;
+          const qw = document.getElementById('qrWifi');
+          if (!qw.getAttribute('src')) {
+            qw.onload = () => { qw.style.display = 'block'; };
+            qw.src = '/wifi-qr.png';
+          }
+          const qwo = document.getElementById('qrWifiOpen');
+          if (!qwo.getAttribute('src')) {
+            qwo.onload = () => { qwo.style.display = 'block'; };
+            qwo.src = '/wifi-open-qr.png';
+          }
+          setupEl.style.display = 'flex';
+          pair.style.display = 'none';
+          return;   // setup takes over; skip the address / pairing / content logic
+        }
+        setupEl.style.display = 'none';
+
+        // List every address the device has, labeled (Wi-Fi / Ethernet), one per
+        // line — never 127.0.0.1. When it has none yet, say so instead.
+        const addrs = data.addresses || [];
+        const addrText = addrs.length
+          ? addrs.map(function (a) { return a.label + ':  ' + a.url; }).join('\n')
+          : 'Not connected to a network yet';
+        document.getElementById('idleAddrs').textContent = addrText;
+        document.getElementById('bootAddrs').textContent = addrText;
+        const qi = document.getElementById('qrIdle'),
+              qp = document.getElementById('qrPair'),
+              qb = document.getElementById('qrBoot');
+        if (data.connect_url) {
+          document.getElementById('pairUrl').textContent = data.connect_url;
+          if (data.connect_url !== lastUrl) {
+            lastUrl = data.connect_url;
+            const qsrc = '/qr.png?u=' + encodeURIComponent(data.connect_url);
+            qi.onload = () => { qi.style.display = 'block'; document.getElementById('qrIdleCap').style.display = 'block'; };
+            qp.onload = () => { qp.style.display = 'block'; };
+            qb.onload = () => { qb.style.display = 'block'; document.getElementById('qrBootCap').style.display = 'block'; };
+            qi.onerror = qp.onerror = qb.onerror = () => { lastUrl = ''; };  // retry next poll
+            qi.src = qsrc; qp.src = qsrc; qb.src = qsrc;
+          }
+        } else {
+          // No network yet: nothing to encode, so hide the QR and clear stale state.
+          lastUrl = '';
+          document.getElementById('pairUrl').textContent = '';
+          [qi, qp, qb].forEach((e) => { e.style.display = 'none'; e.removeAttribute('src'); });
+          document.getElementById('qrIdleCap').style.display = 'none';
+          document.getElementById('qrBootCap').style.display = 'none';
+        }
+
+        if (data.pairing_code) {
+          pairCode.textContent = data.pairing_code;
+          pair.style.display = 'flex';
+        } else {
+          pair.style.display = 'none';
+        }
+
+        const sig = JSON.stringify({ i: data.items || [], s: !!data.shuffle });
+        if (sig !== signature) {
+          signature = sig;
+          items = data.items || [];
+          shuffle = !!data.shuffle;
+          pos = 0;
+          rebuild();
+          buildOrder();
+          playCurrent();
+        }
+      } catch (e) { /* keep showing what we have if a fetch fails */ }
+    }
+
+    // Build the DOM layer for one item: an <img> (image / pptx slideshow) or an
+    // <iframe> (web page / Google Slides).
+    function buildLayer(item) {
+      const layer = document.createElement('div');
+      layer.className = 'layer';
+      let el;
+      if (item.type === 'image') {
+        el = document.createElement('img');
+        el.src = embedSrc(item.src);
+      } else if (item.type === 'slideshow') {
+        el = document.createElement('img');   // src is set per-slide while playing
+      } else if (item.type === 'video') {
+        el = document.createElement('video');
+        el.muted = true; el.defaultMuted = true; el.setAttribute('muted', '');
+        el.playsInline = true; el.setAttribute('playsinline', '');
+        el.preload = 'none';          // don't buffer every video at once; load on play
+        el.src = item.src;
+      } else {
+        el = document.createElement('iframe');
+        el.src = embedSrc(item.src);
+        el.allow = 'autoplay; fullscreen';
+        if (isSlides(item.src)) el.className = 'slides';
+      }
+      layer.appendChild(el);
+      return layer;
+    }
+
+    // Reconcile mounted layers with the current items, reusing a layer when the
+    // same content is still at the same slot so iframes are not needlessly reloaded.
+    function rebuild() {
+      const next = [];
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        const content = item.src || (item.srcs || []).join(',');
+        const key = i + '|' + item.type + '|' + content;
+        const prev = layers[i];
+        let entry;
+        if (prev && prev.key === key) {
+          entry = prev;
+          entry.item = item;            // refresh (e.g. an edited per-slide time)
+        } else {
+          const src = (item.type === 'url' || item.type === 'image') ? embedSrc(item.src) : '';
+          entry = { key, item, src, slides: item.type === 'url' && isSlides(item.src || ''), el: buildLayer(item) };
+          stage.appendChild(entry.el);
+        }
+        next.push(entry);
+      }
+      for (const old of layers) {
+        if (!next.includes(old) && old.el.parentNode) old.el.parentNode.removeChild(old.el);
+      }
+      layers = next;
+    }
+
+    // Default order is top-to-bottom, exactly as listed. Shuffle is opt-in.
+    function buildOrder() {
+      order = items.map((_, i) => i);
+      if (shuffle) {
+        for (let i = order.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [order[i], order[j]] = [order[j], order[i]];
+        }
+      }
+    }
+
+    function clearPendingSlide() {
+      if (pendingSlide) { clearTimeout(pendingSlide.timer); pendingSlide.iframe.onload = null; pendingSlide = null; }
+    }
+    function clearTimers() {
+      if (cycleTimer) { clearTimeout(cycleTimer); cycleTimer = null; }
+      if (ytBeat) { clearInterval(ytBeat); ytBeat = null; }
+      clearPendingSlide();
+      layers.forEach(e => {
+        const v = e.el.querySelector('video');
+        if (v) { v.onended = null; v.onerror = null; try { v.pause(); } catch (_) {} }
+        // Layers stay mounted (opacity 0) so their iframes keep running — pause a
+        // backgrounded YouTube so a Pi isn't decoding two videos at once.
+        if (e.item && e.item.youtube) {
+          const f = e.el.querySelector('iframe');
+          if (f) ytCmd(f, 'pauseVideo');
+        }
+      });
+    }
+    function revealLayer(idx) {
+      layers.forEach((e, n) => e.el.classList.toggle('active', n === idx));
+    }
+    function advance() {
+      pos = (pos + 1) % order.length;
+      playCurrent();
+    }
+
+    // Show whatever is current. A pptx slideshow plays through all its slides and
+    // a Google Slides deck plays through its whole deck (restarted at slide 1)
+    // before we move on — never cut off mid-deck.
+    function playCurrent() {
+      clearTimers();
+      if (!bootDone) return;                       // boot splash owns the screen first
+      if (!items.length) {                         // nothing to play → idle/setup screen
+        idle.style.display = 'flex';
+        layers.forEach(e => e.el.classList.remove('active'));
+        return;
+      }
+      idle.style.display = 'none';
+      const idx = order[pos % order.length];
+      const item = items[idx];
+      const single = items.length === 1;
+      if (item.type === 'slideshow') {
+        playSlideshow(idx, single);
+      } else if (item.type === 'video') {
+        playVideo(idx, single);
+      } else if (item.youtube) {
+        playYouTube(idx, single);
+      } else if (layers[idx] && layers[idx].slides) {
+        playSlidesDeck(idx, single);
+      } else {
+        revealLayer(idx);
+        if (!single) cycleTimer = setTimeout(advance, dur(item));
+      }
+    }
+
+    // A pptx: one item, many image slides. Step through them, then move on (or
+    // loop the show if it's the only thing on the playlist).
+    function playSlideshow(idx, single) {
+      const entry = layers[idx];
+      const item = entry.item;
+      const img = entry.el.querySelector('img');
+      const srcs = item.srcs || [];
+      if (!srcs.length) { if (!single) advance(); return; }
+      let s = 0;
+      const step = () => {
+        img.src = srcs[s];
+        revealLayer(idx);
+        cycleTimer = setTimeout(() => {
+          s += 1;
+          if (s >= srcs.length) { if (single) { s = 0; step(); } else advance(); }
+          else step();
+        }, dur(item));
+      };
+      step();
+    }
+
+    // A Google Slides deck: load it and let it auto-advance. loop=true keeps it
+    // cycling on its own, so it never parks on the last slide. On a multi-item
+    // playlist we move on after the whole-deck duration; a lone deck just loops (no
+    // reload, so no black gap). We keep the previous layer up until it has loaded.
+    function playSlidesDeck(idx, single) {
+      const entry = layers[idx];
+      const iframe = entry.el.querySelector('iframe');
+      let done = false;
+      const go = () => {
+        if (done) return;
+        done = true;
+        clearPendingSlide();
+        revealLayer(idx);
+        if (!single) cycleTimer = setTimeout(advance, dur(entry.item));
+      };
+      iframe.onload = go;
+      iframe.src = entry.src;                       // reassigning src restarts at slide 1
+      pendingSlide = { iframe, timer: setTimeout(go, 3500) };  // fail-safe if onload never fires
+    }
+
+    // A video: play it through and advance when it ends (or loop it if it's the
+    // only item). A positive item.seconds caps it; 0 means play in full.
+    function playVideo(idx, single) {
+      const entry = layers[idx];
+      const item = entry.item;
+      const v = entry.el.querySelector('video');
+      revealLayer(idx);
+      v.loop = single;
+      // Muted unless the item asks for sound. A muted video always autoplays; with
+      // sound it needs the kiosk's autoplay-policy flag — if that's missing the play
+      // is rejected, so fall back to muted so the video still shows, not freezes.
+      v.muted = !item.sound;
+      v.defaultMuted = v.muted;
+      try { v.currentTime = 0; } catch (e) {}
+      const p = v.play();
+      if (p && p.catch) p.catch(() => {
+        if (!v.muted) { v.muted = true; v.defaultMuted = true; v.play().catch(() => {}); }
+      });
+      if (single) {
+        v.onerror = () => { idle.style.display = 'flex'; };  // a broken lone video → idle, not black
+        return;
+      }
+      let done = false;
+      const finish = () => { if (done) return; done = true; v.onended = null; v.onerror = null; advance(); };
+      v.onended = finish;
+      v.onerror = () => setTimeout(finish, 1000);  // a broken/unreachable video is skipped promptly
+      // Advance when the video ends. Fail-safe: the user's cap if set, else the
+      // real duration once known, else a sane bound — never 30 minutes of black.
+      const fallback = () => (isFinite(v.duration) && v.duration > 0) ? (v.duration + 5) * 1000 : 600000;
+      const capMs = (item.seconds && item.seconds > 0) ? item.seconds * 1000 : fallback();
+      cycleTimer = setTimeout(finish, capMs);
+      v.onloadedmetadata = () => {
+        if (done || (item.seconds && item.seconds > 0)) return;
+        clearTimeout(cycleTimer);
+        cycleTimer = setTimeout(finish, fallback());  // tighten to the real length
+      };
+    }
+
+    // A YouTube video: play it through and move on when it ends — the same
+    // "play in full" idea as an uploaded video. YouTube lives in an iframe, so we
+    // can't watch its <video> directly; instead we speak YouTube's own postMessage
+    // API (the embed carries enablejsapi=1). We never load YouTube's script — it's
+    // online-only anyway — we just send the {event:'listening'} handshake and read
+    // the state + timing it posts back. A lone video loops itself; in a list, we
+    // advance when it ends. Anti-freeze: if nothing is heard back (offline, API
+    // blocked), a multi-item list still moves on instead of sitting on black.
+    function ytMsg(win, body) {
+      try { win.postMessage(JSON.stringify(body), '*'); } catch (e) {}
+    }
+    function ytListen(iframe) { ytMsg(iframe.contentWindow, { event: 'listening', id: 1, channel: 'widget' }); }
+    function ytCmd(iframe, func, args) {
+      ytMsg(iframe.contentWindow, { event: 'command', func: func, args: args || [], id: 1, channel: 'widget' });
+    }
+    function playYouTube(idx, single) {
+      const entry = layers[idx];
+      const iframe = entry.el.querySelector('iframe');
+      entry.ytEnded = false;
+      entry.ytSingle = single;
+      entry.ytAlive = false;
+      entry.ytCcDone = false;
+      // A lone video loops seamlessly via YouTube's own loop (no API round-trip), so
+      // it can't get stuck on the end screen if a message is missed. A video in a
+      // list must NOT loop — native loop suppresses the "ended" event we advance on.
+      let src = entry.src;
+      if (single) {
+        const vid = (src.match(/\/embed\/([^/?#]+)/) || [])[1];
+        if (vid) src += (src.indexOf('?') >= 0 ? '&' : '?') + 'loop=1&playlist=' + vid;
+      }
+      // Keep the previous layer up until the video has (re)loaded, so switching to
+      // it crossfades instead of flashing black — same trick as the Slides deck.
+      let shown = false;
+      const go = () => { if (shown) return; shown = true; clearPendingSlide(); revealLayer(idx); ytHandshake(iframe, entry); };
+      iframe.onload = go;
+      iframe.src = src;                               // reassigning src restarts from the top
+      pendingSlide = { iframe, timer: setTimeout(go, 3500) };  // reveal anyway if onload never fires
+      if (single) {
+        // A lone video loops itself; if it never reports life (offline, blocked,
+        // removed), fall back to the idle screen instead of a black frame — the
+        // same courtesy a broken uploaded video gets. The handshake retries for
+        // ~9s, so silence past 12s means it genuinely isn't playing.
+        cycleTimer = setTimeout(() => { if (!entry.ytAlive) { idle.style.display = 'flex'; } }, 12000);
+      } else {
+        // Bridge until the video reports its length; the first report retunes this
+        // to the real time remaining. If no report ever comes, skip, don't freeze.
+        cycleTimer = setTimeout(advance, 30000);
+      }
+    }
+
+    // Open the postMessage channel. A single {event:'listening'} can land before the
+    // embed's player has registered its own listener and be lost, which would leave
+    // us with no timing (a list would then cut the video off at the 30s anti-freeze).
+    // So resend until the player answers (entry.ytAlive), then stop.
+    function ytHandshake(iframe, entry) {
+      if (ytBeat) clearInterval(ytBeat);
+      let tries = 0;
+      ytListen(iframe);
+      ytBeat = setInterval(() => {
+        if (entry.ytAlive || tries++ > 15 || !iframe.isConnected) { clearInterval(ytBeat); ytBeat = null; return; }
+        ytListen(iframe);
+      }, 600);
+    }
+
+    // YouTube posts state ('onStateChange') and timing ('infoDelivery', ~4x/sec
+    // while playing). Only the video we're showing right now may drive playback —
+    // a still-mounted background video (opacity 0) must never advance us.
+    window.addEventListener('message', (ev) => {
+      if (typeof ev.data !== 'string') return;
+      let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (!msg || (msg.event !== 'infoDelivery' && msg.event !== 'onStateChange')) return;
+      const idx = order.length ? order[pos % order.length] : -1;
+      const entry = layers[idx];
+      if (!entry || !entry.item || !entry.item.youtube) return;
+      const iframe = entry.el.querySelector('iframe');
+      if (!iframe || ev.source !== iframe.contentWindow) return;
+      entry.ytAlive = true;                           // the player is answering — it's really playing
+
+      // Captions off: a muted YouTube video auto-shows captions, and cc_load_policy=0
+      // in the URL doesn't stop it — so once the player answers, tell it to drop the
+      // caption module. (Captions ON is handled by cc_load_policy=1 in the embed URL.)
+      if (entry.item.cc === false && !entry.ytCcDone) {
+        entry.ytCcDone = true;
+        ytCmd(iframe, 'unloadModule', ['captions']);
+        ytCmd(iframe, 'unloadModule', ['cc']);
+        ytCmd(iframe, 'setOption', ['captions', 'track', {}]);
+      }
+
+      const info = msg.info;
+      const obj = info && typeof info === 'object';
+      const state = (msg.event === 'onStateChange') ? info : (obj ? info.playerState : undefined);
+      const duration = obj ? (info.duration || 0) : 0;
+      const at = obj ? (info.currentTime || 0) : 0;
+
+      // Retune the anti-freeze timer to the real time left (+5s), multi-item only.
+      // Using time-remaining (not full length) keeps the deadline pinned to the
+      // video's end however often reports arrive, and covers a stall mid-play.
+      if (!entry.ytSingle && !entry.ytEnded && duration > 0) {
+        clearTimeout(cycleTimer);
+        cycleTimer = setTimeout(advance, (Math.max(0, duration - at) + 5) * 1000);
+      }
+      if (state === 0 && !entry.ytSingle && !entry.ytEnded) {  // 0 = ENDED; a lone video loops itself
+        entry.ytEnded = true;
+        clearTimeout(cycleTimer);
+        advance();
+      }
+    });
+
+    // Show the address for ~1 minute after boot, then hand the screen to content.
+    setTimeout(() => {
+      bootDone = true;
+      document.getElementById('boot').style.display = 'none';
+      playCurrent();
+    }, 60000);
+
+    loadData();
+    setInterval(loadData, 10000);
+  </script>
+</body>
+</html>

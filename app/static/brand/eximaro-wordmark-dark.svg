@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Eximaro wordmark — dark backgrounds (TV, dark mode). Same implementation note as light variant. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="72" viewBox="0 0 320 72" role="img" aria-label="eximaro">
+  <style>text{font-family:'Sora',sans-serif;font-weight:600;letter-spacing:-0.5px;}</style>
+  <text x="8" y="50" font-size="44" fill="#EDEFF1">e<tspan fill="#6AB0F3">x</tspan>imaro</text>
+</svg>

@@ -1,0 +1,174 @@
+<!doctype html>
+<!-- Copyright (C) 2026 Consecrated Tech. License: PolyForm-Noncommercial-1.0.0 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Set up this device</title>
+<link rel="icon" href="/static/brand/eximaro-icon.svg">
+<!-- Tokens + fonts are vendored locally (app/static) so the device never depends
+     on the internet. Licensing: app/static/fonts/OFL.txt. -->
+<link rel="stylesheet" href="/static/tokens.css">
+<link rel="stylesheet" href="/static/fonts/fonts.css">
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{
+    background:var(--bg);
+    color:var(--ink);
+    font:16px/1.55 "Hanken Grotesk",system-ui,sans-serif;
+    min-height:100vh;
+    display:flex;align-items:center;justify-content:center;
+    padding:28px;
+    -webkit-font-smoothing:antialiased;
+  }
+  .stage{width:100%;max-width:680px}
+
+  .head{text-align:center;margin-bottom:26px}
+  .wordmark{
+    font-family:"Sora",sans-serif;font-weight:600;font-size:2rem;
+    letter-spacing:-.02em;color:var(--ink);
+  }
+  .wordmark .x{color:var(--accent)}
+  .tagline{color:var(--muted);margin:4px 0 0}
+
+  /* the device "awake" reassurance panel */
+  .device{
+    background:var(--surface);border:1px solid var(--line);
+    border-radius:var(--r-md);
+    padding:16px 18px;display:flex;align-items:center;gap:14px;
+    margin-bottom:26px;
+  }
+  .pulse{position:relative;flex:none;width:12px;height:12px}
+  .pulse i{
+    position:absolute;inset:0;border-radius:50%;
+    background:var(--accent);box-shadow:0 0 0 0 var(--accent-soft);
+    animation:glow 2.8s ease-in-out infinite;
+  }
+  @keyframes glow{
+    0%,100%{box-shadow:0 0 0 0 var(--accent-soft);opacity:.92}
+    50%{box-shadow:0 0 0 10px rgba(47,127,224,0);opacity:1}
+  }
+  .device .label{font-weight:600}
+  .device .sub{color:var(--muted);font-size:.92rem}
+  .device .id{
+    margin-left:auto;font:.82rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);
+    background:var(--bg);border:1px solid var(--line);
+    padding:6px 10px;border-radius:9px;white-space:nowrap;
+  }
+
+  .ask{font-family:"Sora",sans-serif;font-weight:600;font-size:1.2rem;
+    letter-spacing:-.01em;margin:0 0 14px}
+
+  .choices{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .choice{
+    position:relative;display:flex;flex-direction:column;
+    background:var(--surface);border:1px solid var(--line);
+    border-radius:var(--r-lg);padding:22px;margin:0;
+  }
+  /* Display is the common choice — mark it as the quiet default. */
+  .choice.pick{border:2px solid var(--accent);padding:21px}
+  .choice .tag{
+    position:absolute;top:14px;right:14px;
+    font-size:.66rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+    color:var(--accent-text);background:var(--accent-soft);
+    padding:3px 9px;border-radius:var(--r-pill);
+  }
+  .choice .ico{color:var(--accent);margin-bottom:14px}
+  .choice h2{
+    font-family:"Sora",sans-serif;
+    font-weight:600;font-size:1.18rem;margin:0 0 6px;letter-spacing:-.01em;
+  }
+  .choice p{color:var(--muted);font-size:.93rem;margin:0 0 20px}
+  .choice .go{
+    margin-top:auto;border:0;cursor:pointer;
+    font:inherit;font-weight:600;
+    padding:13px 16px;border-radius:var(--r-sm);
+    display:inline-flex;align-items:center;justify-content:space-between;gap:10px;
+    transition:background .15s ease,transform .12s ease,border-color .15s ease;
+  }
+  .choice .go.primary{background:var(--ink);color:#fff}
+  .choice .go.primary:hover{background:#000}
+  .choice .go.secondary{background:var(--surface);color:var(--ink);border:1px solid var(--line)}
+  .choice .go.secondary:hover{background:var(--bg);border-color:var(--muted)}
+  .choice .go:active{transform:translateY(1px)}
+  .choice .go svg{flex:none}
+
+  .foot{
+    margin-top:24px;color:var(--muted);font-size:.9rem;
+    display:flex;align-items:center;gap:8px;justify-content:center;
+  }
+  .foot .dot{width:6px;height:6px;border-radius:50%;background:var(--accent)}
+
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:6px}
+
+  @media (max-width:560px){
+    .choices{grid-template-columns:1fr}
+    .device{flex-wrap:wrap}
+    .device .id{margin-left:0;order:3;width:100%}
+  }
+  @media (prefers-reduced-motion:reduce){
+    .pulse i{animation:none}
+  }
+</style>
+</head>
+<body>
+  <main class="stage">
+    <div class="head">
+      <div class="wordmark">e<span class="x">x</span>imaro</div>
+      <p class="tagline">Let&rsquo;s set up this device</p>
+    </div>
+
+    <section class="device" aria-label="Device status">
+      <span class="pulse"><i></i></span>
+      <span>
+        <span class="label">This device is awake and ready</span><br>
+        <span class="sub">Nothing here can break it — you can change your choice anytime.</span>
+      </span>
+      <span class="id" id="deviceName">__DEVICE_NAME__</span>
+    </section>
+
+    <p class="ask">What should this device do?</p>
+
+    <div class="choices">
+      <!-- Display (the common choice) -->
+      <form class="choice pick" method="post" action="/api/role">
+        <span class="tag">Most devices</span>
+        <span class="ico" aria-hidden="true">
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+        </span>
+        <h2>Show content</h2>
+        <p>This screen displays the slides, images, and pages sent to it. Most devices are this.</p>
+        <button class="go primary" name="role" value="display">
+          Make this a display
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+        </button>
+      </form>
+
+      <!-- Controller -->
+      <form class="choice" method="post" action="/api/role">
+        <span class="ico" aria-hidden="true">
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="2" fill="var(--surface)"/><circle cx="15" cy="12" r="2" fill="var(--surface)"/><circle cx="8" cy="18" r="2" fill="var(--surface)"/></svg>
+        </span>
+        <h2>Run the controls</h2>
+        <p>Manage this screen and others from here. Pick this on the one device you'll set things up from.</p>
+        <button class="go secondary" name="role" value="controller">
+          Run controls here
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+        </button>
+      </form>
+    </div>
+
+    <p class="foot"><span class="dot"></span> You can switch a device between these roles later in Settings.</p>
+  </main>
+
+  <script>
+    // When opened directly as a file (not served by the app), the template
+    // token is still here — show a sample name so the preview looks real.
+    var el = document.getElementById('deviceName');
+    if (el && el.textContent.indexOf('__DEVICE_NAME__') !== -1) {
+      el.textContent = 'eximaro-e4e01a';
+    }
+  </script>
+</body>
+</html>

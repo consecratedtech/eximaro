@@ -1,0 +1,57 @@
+/*
+ * Eximaro — "Skylight Mono" design tokens (Palette 4).
+ * The single source of truth for color and shape across every app surface:
+ * the controller panel, the first-run setup page, and the display screen.
+ * Almost no color — ink and warm white do the work; sky appears only when
+ * something needs attention or action. All pairs meet WCAG AA.
+ */
+:root{
+  /* Light — the controller panel and phone pages */
+  --bg:#F8F9FA;          /* page background (Cloud) */
+  --surface:#FFFFFF;     /* cards, inputs */
+  --ink:#17191C;         /* primary text, primary buttons */
+  --muted:#5E646B;       /* secondary text (AA on white) */
+  --line:#E6E8EA;        /* borders, dividers */
+  --accent:#2F7FE0;      /* the x, focus rings, toggles, dots — UI only */
+  --accent-text:#1F66BD; /* links and sky-colored text on light (AA) */
+  --accent-soft:#E3F0FC; /* selected / quiet-action backgrounds */
+  --ok:#27A567;          /* status dots (never text) */
+  --ok-text:#1E7A4E;     /* green text where needed (AA) */
+  --danger:#C93B3B;      /* offline / error text and dots (AA) */
+  --danger-soft:#FAE9E9; /* error card backgrounds */
+  --solid-fg:#FFFFFF;    /* text on the ink solid surfaces (primary button, nav pill, tooltip) */
+
+  /* Dark — anything a TV shows */
+  --d-bg:#101214;
+  --d-surface:#191C1F;
+  --d-ink:#EDEFF1;
+  --d-muted:#9AA1A9;
+  --d-line:#2A2E33;
+  --d-accent:#6AB0F3;
+  --d-accent-soft:#1B2836;
+
+  /* Shape */
+  --r-sm:10px;   /* inputs, buttons */
+  --r-md:14px;   /* cards */
+  --r-lg:20px;   /* feature cards, modals */
+  --r-pill:99px; /* nav pills, chips, toggles */
+}
+
+/* Dark theme for the admin pages — remap the light tokens to the dark set (the same
+   values the TV screens use). Applied when the operator picks Dark in Settings
+   (html[data-theme=dark]), or when their device prefers dark and they haven't forced
+   Light. Picking Light forces light even on a dark device. The one decoupled token is
+   --solid-fg (text on the ink button/nav/tooltip), which flips so a now-light solid
+   surface gets dark text. */
+:root[data-theme="dark"]{
+  --bg:var(--d-bg); --surface:var(--d-surface); --ink:var(--d-ink); --muted:var(--d-muted);
+  --line:var(--d-line); --accent:var(--d-accent); --accent-text:var(--d-accent);
+  --accent-soft:var(--d-accent-soft); --solid-fg:var(--d-bg);
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:var(--d-bg); --surface:var(--d-surface); --ink:var(--d-ink); --muted:var(--d-muted);
+    --line:var(--d-line); --accent:var(--d-accent); --accent-text:var(--d-accent);
+    --accent-soft:var(--d-accent-soft); --solid-fg:var(--d-bg);
+  }
+}

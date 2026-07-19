@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Eximaro wordmark — light backgrounds.
+     NOTE FOR IMPLEMENTATION: this file uses live text in Sora SemiBold (600).
+     In the app, render the wordmark as styled HTML text (see DESIGN.md §3) — no image needed.
+     For contexts that need a self-contained file (social cards, print), outline this text
+     to paths once Sora is vendored:  pip install fonttools;  or open in Inkscape → Path > Object to Path. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="72" viewBox="0 0 320 72" role="img" aria-label="eximaro">
+  <style>text{font-family:'Sora',sans-serif;font-weight:600;letter-spacing:-0.5px;}</style>
+  <text x="8" y="50" font-size="44" fill="#17191C">e<tspan fill="#2F7FE0">x</tspan>imaro</text>
+</svg>

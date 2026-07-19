@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# Copyright (C) 2026 Consecrated Tech
+"""Privileged network helper — runs nmcli for the sandboxed app.
+
+The app can't touch the network by design (its service is locked down), so it
+drops a small JSON request in the data dir and a root path unit runs this. We read
+the request, do the one action it asks for, and write the result back to a file the
+app can read. The app never runs nmcli itself.
+
+Only a fixed list of actions is honored, and every value that comes from the
+request (an SSID, a password) is handed to nmcli as a separate argument — never
+pasted into a shell line — so a request can't smuggle in extra commands.
+
+Actions so far: "scan" (list nearby networks) and "status" (what the radio is
+doing). Hosting the setup network and joining a chosen one come next."""
+
+import json
+import os
+import shutil
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+DATA = Path(os.environ.get("DATA_DIR", "/var/lib/eximaro"))
+APP_USER = os.environ.get("APP_USER", "eximaro")
+REQUEST = DATA / "wifi.request"
+SCAN = DATA / "wifi-scan.json"
+STATUS = DATA / "wifi-status.json"
+
+NMCLI = shutil.which("nmcli") or "/usr/bin/nmcli"
+NFT = shutil.which("nft") or "/usr/sbin/nft"
+
+# Captive-portal redirect: send port 80 on the setup-AP interface to the app on
+# 8080, so a joined phone's connectivity probes reach the app and it can bounce
+# them to the setup page (which is what makes phones auto-open it). Kept in its OWN
+# nftables table so tearing it down is one atomic delete that can never touch
+# NetworkManager's masquerade/forward rules — it cannot strand the AP.
+CAPTIVE_TABLE = "eximaro_captive"
+CAPTIVE_RULESET = """table ip eximaro_captive {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    iifname "wlan0" tcp dport 80 redirect to :8080
+  }
+}
+"""
+
+
+def _nft(*args, input_text=None):
+    return subprocess.run([NFT, *args], input=input_text,
+                          capture_output=True, text=True, timeout=10)
+
+
+def _captive_on() -> None:
+    """Add the :80->:8080 redirect on the AP. Best-effort: if nft is missing or
+    fails the AP still works (the on-screen QR/URL is unaffected) — we just lose the
+    auto-popup. Delete-then-add so a stale rule left by a crash is reset first."""
+    try:
+        _nft("delete", "table", "ip", CAPTIVE_TABLE)   # clear any stale copy
+    except Exception:
+        pass
+    try:
+        _nft("-f", "-", input_text=CAPTIVE_RULESET)
+    except Exception:
+        pass
+
+
+def _captive_off() -> None:
+    """Remove the redirect table. Atomic and self-contained — only ever touches our
+    own table, so it can't affect client-mode networking or NetworkManager."""
+    try:
+        _nft("delete", "table", "ip", CAPTIVE_TABLE)
+    except Exception:
+        pass
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _give_to_app(path: Path) -> None:
+    """Hand a result file to the app user, readable only by it."""
+    try:
+        import pwd  # Unix-only; imported here so the pure parser stays importable anywhere
+        info = pwd.getpwnam(APP_USER)
+        os.chown(path, info.pw_uid, info.pw_gid)
+        os.chmod(path, 0o600)
+    except (KeyError, OSError, ModuleNotFoundError):
+        pass
+
+
+def _write(path: Path, obj: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj))
+    tmp.replace(path)
+    _give_to_app(path)
+
+
+def _nmcli(*args, timeout: int = 30) -> subprocess.CompletedProcess:
+    return subprocess.run([NMCLI, *args], capture_output=True, text=True, timeout=timeout)
+
+
+def _split_terse(line: str) -> list:
+    """Split one line of `nmcli -t` output. Terse mode separates fields with ':'
+    and escapes any ':' or '\\' inside a value as '\\:' / '\\\\', so a naive split
+    would mangle SSIDs that contain a colon."""
+    out, cur, i = [], "", 0
+    while i < len(line):
+        c = line[i]
+        if c == "\\" and i + 1 < len(line):
+            cur += line[i + 1]
+            i += 2
+            continue
+        if c == ":":
+            out.append(cur)
+            cur = ""
+            i += 1
+            continue
+        cur += c
+        i += 1
+    out.append(cur)
+    return out
+
+
+def do_scan(req=None) -> None:
+    """List nearby networks, strongest signal first, one entry per SSID."""
+    _nmcli("device", "wifi", "rescan", timeout=20)
+    res = _nmcli("-t", "-f", "SSID,SIGNAL,SECURITY", "device", "wifi", "list", timeout=20)
+    nets, seen = [], set()
+    for line in res.stdout.splitlines():
+        parts = _split_terse(line)
+        if len(parts) < 3:
+            continue
+        ssid = parts[0]
+        if not ssid or ssid in seen:
+            continue  # hidden networks have a blank SSID; collapse duplicates
+        seen.add(ssid)
+        try:
+            signal = int(parts[1])
+        except ValueError:
+            signal = 0
+        nets.append({"ssid": ssid, "signal": signal, "secure": parts[2] != ""})
+    nets.sort(key=lambda n: n["signal"], reverse=True)
+    _write(SCAN, {"networks": nets, "when": _now()})
+
+
+def do_status(req=None) -> None:
+    """What the Wi-Fi radio is doing right now: connected/disconnected, to which
+    network, and whether we're currently hosting the setup network."""
+    st = {"wifi": None, "ssid": None, "ap_active": False, "when": _now()}
+    res = _nmcli("-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status")
+    for line in res.stdout.splitlines():
+        p = _split_terse(line)
+        if len(p) >= 4 and p[1] == "wifi":
+            st["wifi"] = p[2]
+            if p[3] == "Hotspot":
+                st["ap_active"] = True
+            elif p[2] == "connected":
+                st["ssid"] = p[3]
+    _write(STATUS, st)
+
+
+COUNTRY = os.environ.get("WIFI_COUNTRY", "US")
+
+
+def _set_country() -> None:
+    """A regulatory country must be set before the radio will host an AP. On Pi OS
+    raspi-config sets it persistently; ignore failure (already set, or not Pi OS)."""
+    try:
+        subprocess.run(["raspi-config", "nonint", "do_wifi_country", COUNTRY],
+                       capture_output=True, text=True, timeout=15)
+    except Exception:
+        pass
+
+
+def do_hotspot(req) -> None:
+    """Host the setup network so a phone can join and hand over the real Wi-Fi.
+    The app picks the name + password (it also builds the QR from them)."""
+    ssid = (req.get("ssid") or "")[:32]
+    password = req.get("password") or ""
+    if not ssid or len(password) < 8:
+        _write(STATUS, {"error": "hotspot needs an ssid and an 8+ char password", "when": _now()})
+        return
+    _set_country()
+    _nmcli("connection", "delete", "Hotspot", timeout=10)  # clear any stale one first
+    r = _nmcli("device", "wifi", "hotspot", "ifname", "wlan0",
+               "ssid", ssid, "password", password, "band", "bg", timeout=30)
+    ok = r.returncode == 0
+    if ok:
+        _captive_on()   # turn the setup network into a captive portal
+    _write(STATUS, {"ap_active": ok, "ap_ssid": ssid if ok else None,
+                    "wifi": "hotspot" if ok else None,
+                    "error": None if ok else r.stderr.strip()[:200], "when": _now()})
+
+
+def do_connect(req) -> None:
+    """Join a real network. The radio can't host the AP and join at the same time,
+    so drop the AP first; if the join fails, bring the AP back so they can retry."""
+    ssid = (req.get("ssid") or "")[:64]
+    password = req.get("password") or ""
+    if not ssid:
+        _write(STATUS, {"error": "no network name given", "when": _now()})
+        return
+    _nmcli("connection", "down", "Hotspot", timeout=15)
+    args = ["device", "wifi", "connect", ssid, "ifname", "wlan0"]
+    if password:
+        args += ["password", password]
+    r = _nmcli(*args, timeout=45)
+    if r.returncode == 0:
+        _nmcli("connection", "delete", "Hotspot", timeout=10)  # don't let the AP come back
+        _captive_off()   # clean client mode — no redirect left behind
+        do_status(req)
+    else:
+        _nmcli("connection", "up", "Hotspot", timeout=20)  # restore setup mode to retry
+        _captive_on()    # re-arm the portal so a retry still auto-opens
+        _write(STATUS, {"error": f"could not join {ssid}", "detail": r.stderr.strip()[:200],
+                        "ap_active": True, "when": _now()})
+
+
+def do_stop(req) -> None:
+    """Take down the setup network."""
+    _nmcli("connection", "down", "Hotspot", timeout=15)
+    _nmcli("connection", "delete", "Hotspot", timeout=10)
+    _captive_off()
+    _write(STATUS, {"ap_active": False, "when": _now()})
+
+
+ACTIONS = {"scan": do_scan, "status": do_status,
+           "hotspot": do_hotspot, "connect": do_connect, "stop": do_stop}
+
+
+def main() -> None:
+    try:
+        req = json.loads(REQUEST.read_text())
+    except (json.JSONDecodeError, OSError):
+        req = {}
+    finally:
+        try:
+            REQUEST.unlink()
+        except OSError:
+            pass
+    fn = ACTIONS.get(req.get("action"))
+    if not fn:
+        return
+    try:
+        fn(req)
+    except Exception as exc:  # never leave the request stuck; report and move on
+        _write(STATUS, {"error": str(exc), "action": req.get("action"), "when": _now()})
+
+
+if __name__ == "__main__":
+    main()

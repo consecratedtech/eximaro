@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# Copyright (C) 2026 Consecrated Tech
+#
+# eximaro-set-url — add a link to what a device shows and, on a controller, push it
+# out to the paired displays. Made for remote fleet management (run as root over
+# SSH / an RMM):
+#
+#   sudo eximaro-set-url "https://docs.google.com/presentation/d/DECK/pub?start=true&loop=true"
+#   sudo eximaro-set-url "https://example.com/board" 20        # a web page, 20s on screen
+#   sudo eximaro-set-url --replace "https://…"                 # wipe current content first
+#
+# By default it ADDS the link to the current playlist (re-running adds another copy).
+# Pass --replace (or --wipe) to clear the existing content first and show only this.
+# A Google Slides "Publish to web" deck is auto-sized to play all the way through; a
+# plain page/video uses the seconds given (default 15).
+set -euo pipefail
+
+usage() { echo "usage: eximaro-set-url [--replace] <url> [seconds]" >&2; }
+
+REPLACE=0
+POS=()
+for a in "$@"; do
+  case "$a" in
+    --replace|--wipe) REPLACE=1 ;;
+    -h|--help)        usage; exit 0 ;;
+    -*)               echo "unknown option: $a" >&2; usage; exit 2 ;;
+    *)                POS+=("$a") ;;
+  esac
+done
+
+URL="${POS[0]:-}"
+SECS="${POS[1]:-15}"
+[ -n "$URL" ] || { usage; exit 2; }
+[ "$(id -u)" -eq 0 ] || { echo "run with sudo (needs root to act as the app user)." >&2; exit 1; }
+
+APP="/opt/eximaro"; DATA="/var/lib/eximaro"
+
+# Apply the change as the sandboxed app user against its data dir (the same code path
+# the web panel uses, so the running app picks it up on its next poll).
+OUT="$(sudo -u eximaro env EXIMARO_DATA="$DATA" EXIMARO_WORK="$DATA/work" PYTHONPATH="$APP" \
+  "$APP/.venv/bin/python" - "$URL" "$SECS" "$REPLACE" <<'PY'
+import sys
+from app import library, config
+url, secs, replace = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "1"
+if replace:
+    for it in library.list_items():      # wipe the current playlist first
+        library.remove(it["id"])
+item = library.add_url(url, secs)        # add the new link
+try:
+    library.measure_slides(item["id"])   # best-effort: size a Slides deck to the whole deck
+except Exception:
+    pass
+print("SHOWING:" + ", ".join(i["name"] for i in library.list_items()))
+print("ROLE:" + (config.load_config().get("role") or ""))
+PY
+)"
+
+echo "$OUT" | sed -n 's/^SHOWING:/now showing: /p'
+ROLE="$(printf '%s\n' "$OUT" | sed -n 's/^ROLE://p')"
+
+# On a controller, push the updated playlist out to every paired display.
+if [ "$ROLE" = "controller" ]; then
+  if curl -fsS -X POST http://localhost:8080/api/push >/dev/null 2>&1; then
+    echo "pushed to displays"
+  else
+    echo "note: push did not go through — if the panel has a password, it needs a login first" >&2
+  fi
+fi
+echo "done."

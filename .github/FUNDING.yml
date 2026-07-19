@@ -1,0 +1,9 @@
+# Configures the "Sponsor" button GitHub shows at the top of this repo.
+# Docs: https://docs.github.com/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/displaying-a-sponsor-button-in-your-repository
+
+# GitHub Sponsors — payments handled by GitHub natively, the option most
+# developers prefer. Published profile: https://github.com/sponsors/consecratedtech
+github: [consecratedtech]
+
+# Ko-fi — the same donation, for anyone who'd rather not use GitHub Sponsors.
+ko_fi: eximaro

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Eximaro mono mark — inherits currentColor, transparent background.
+     Use inline in UI chrome, favicons-in-context, or anywhere one color is needed. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Eximaro mark">
+  <g transform="translate(256 256)" fill="currentColor">
+    <rect x="-170" y="-42" width="340" height="84" rx="42" transform="rotate(45)"/>
+    <rect x="-170" y="-42" width="340" height="84" rx="42" transform="rotate(-45)"/>
+  </g>
+</svg>

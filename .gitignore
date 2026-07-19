@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.testvenv/
+
+# Runtime data — NEVER commit (secrets + pushed content live here)
+data/
+*.enc
+*.key
+device_id
+config.json
+library.json
+received.json
+activity.json
+promote.request
+promote.status
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Claude Code (local machine settings; not shared)
+.claude/settings.local.json
+
+# Local working backups (not shared)
+.backups/
+
+HANDOFF.md
+eximaro HANDOFF.md
+
+# Brand/design handoff scratch — reference only, not shipped with the app
+DESIGN.md
+exploration-v1.html
+app-screens-v1.html
+
+# Marketing landing page — deployed to Cloudflare, kept out of the app repo
+site/
