@@ -22,9 +22,17 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # Use this device's current role, so there's nothing to pick and nothing to get wrong.
+# Prefer an explicit arg, then the role of record (config.json), then the role the
+# installer seeded into the systemd unit. A device that never switched roles has no
+# config.json, so the unit's EXIMARO_ROLE is the only record of controller-vs-display —
+# without this fallback install.sh would stop to ASK, which hangs a non-interactive
+# (e.g. RMM) shell and could demote a controller to a display.
 ROLE="${1:-}"
 if [ -z "$ROLE" ] && [ -f "${DATA_DIR}/config.json" ]; then
   ROLE="$(python3 -c "import json; print(json.load(open('${DATA_DIR}/config.json')).get('role') or '')" 2>/dev/null || true)"
+fi
+if [ -z "$ROLE" ]; then
+  ROLE="$(sed -n 's/^Environment=EXIMARO_ROLE=\(.*\)$/\1/p' "/etc/systemd/system/${APP}.service" 2>/dev/null | head -n1)"
 fi
 
 echo "==> Downloading the latest eximaro from GitHub..."
