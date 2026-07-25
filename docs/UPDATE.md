@@ -23,7 +23,7 @@ If it says `command not found`, the device doesn't have the updater yet. Add it 
 ```
 sudo apt update
 sudo apt install -y git
-git clone https://github.com/eximaro/eximaro.git
+git clone https://github.com/consecratedtech/eximaro.git
 cd eximaro
 sudo ./install.sh --role display
 ```

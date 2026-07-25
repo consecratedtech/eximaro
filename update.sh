@@ -14,7 +14,7 @@ set -euo pipefail
 
 APP="eximaro"
 DATA_DIR="/var/lib/${APP}"
-REPO_URL="${REPO_URL:-https://github.com/eximaro/eximaro.git}"
+REPO_URL="${REPO_URL:-https://github.com/consecratedtech/eximaro.git}"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Please run with sudo:  sudo bash update.sh"
@@ -35,7 +35,8 @@ fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 if ! git clone --depth 1 "$REPO_URL" "$TMP/eximaro"; then
-  echo "Couldn't download the update — is this device online?"
+  echo "Couldn't download the update. Either this device is offline, or the"
+  echo "repository is private and this device has no access to it yet."
   exit 1
 fi
 

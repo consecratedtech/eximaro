@@ -20,7 +20,7 @@ Type these one line at a time — press **Enter** after each and wait for it to 
 ```
 sudo apt update
 sudo apt install -y git
-git clone https://github.com/eximaro/eximaro.git
+git clone https://github.com/consecratedtech/eximaro.git
 cd eximaro
 sudo ./install.sh --role display
 ```

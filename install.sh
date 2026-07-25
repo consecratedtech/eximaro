@@ -26,7 +26,7 @@ WORK_DIR="${DATA_DIR}/work"         # conversion scratch (NOT /tmp — tmpfs on 
 WEB_PORT="8080"
 # Where to fetch the code when this script is run on its own (the curl | bash
 # one-liner) instead of from a checked-out repo. Override via env for a fork.
-REPO_URL="${REPO_URL:-https://github.com/eximaro/eximaro.git}"
+REPO_URL="${REPO_URL:-https://github.com/consecratedtech/eximaro.git}"
 ROLE=""
 FORCE=0
 CHECK_ONLY=0
@@ -468,7 +468,7 @@ if [ -n "\$SRC_REQ" ] && [ -d "\$SRC_REQ" ] && [ -f "\$SRC_REQ/requirements.txt"
   SRC="\$SRC_REQ"
 else
   SRC="\${DATA_DIR}/_update_src"; rm -rf "\$SRC"
-  if ! git clone --depth 1 "\$REPO_URL" "\$SRC" >/dev/null 2>&1; then say failed "could not download the update (needs internet)"; exit 0; fi
+  if ! git clone --depth 1 "\$REPO_URL" "\$SRC" >/dev/null 2>&1; then say failed "could not download the update (no internet, or the repository is private)"; exit 0; fi
 fi
 REL="\${RELEASES}/rel-\$(date +%s)"; rm -rf "\$REL"; mkdir -p "\$REL"
 cp -a "\$SRC/." "\$REL/"; rm -rf "\$REL/.venv" "\$REL/.git"; chown -R \${APP_USER}:\${APP_USER} "\$REL"
