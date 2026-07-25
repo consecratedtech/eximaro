@@ -12,6 +12,7 @@ import hashlib
 import json
 import shutil
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import commands, config
@@ -118,19 +119,27 @@ def items_for_display(items: list, device_id: str) -> list:
 
 def push_targeted(displays: list, items: list, from_name: str, base_url: str, site_key: str) -> list:
     """Per-display targeting: build each display its own manifest from the items
-    aimed at it, sign it, and push. Untargeted items stack onto every display."""
-    results = []
-    for d in displays:
+    aimed at it, sign it, and push. Untargeted items stack onto every display.
+
+    Displays are pushed concurrently, so one slow or offline display can't hold up
+    the rest — the whole push takes as long as the slowest single display, not the
+    sum of them all. Result order matches the input display order."""
+    def _one(d: dict) -> dict:
+        name = d.get("name") or d["device_id"][:8]
         mine = items_for_display(items, d["device_id"])
         manifest = build_manifest(mine, from_name, base_url)
         signature = commands.sign(site_key, canon(manifest))
         url = f"http://{d['address']}:{d['port']}/api/playlist"
         try:
             post_json(url, {"manifest": manifest, "signature": signature})
-            results.append({"name": d.get("name") or d["device_id"][:8], "ok": True, "count": len(mine)})
+            return {"name": name, "ok": True, "count": len(mine)}
         except Exception as exc:
-            results.append({"name": d.get("name") or d["device_id"][:8], "ok": False, "error": str(exc)})
-    return results
+            return {"name": name, "ok": False, "error": str(exc)}
+
+    if not displays:
+        return []
+    with ThreadPoolExecutor(max_workers=min(8, len(displays))) as pool:
+        return list(pool.map(_one, displays))
 
 
 # --- display side -----------------------------------------------------------

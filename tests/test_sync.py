@@ -170,6 +170,36 @@ def test_items_for_display_empty_targets_means_all():
     assert [i["id"] for i in sync.items_for_display(items, "anyone")] == ["1"]
 
 
+# --- push_targeted (now concurrent across displays) -------------------------
+
+def test_push_targeted_preserves_order_and_isolates_failures(monkeypatch):
+    """Pushing to displays concurrently must not scramble result order or let one
+    unreachable display sink the others: results line up with the input displays,
+    and a display whose POST raises comes back ok=False while the rest stay ok."""
+    def fake_post(url, obj, timeout=10):
+        if "10.0.0.2" in url:            # the middle display is unreachable
+            raise OSError("connection refused")
+        return {"ok": True}
+    monkeypatch.setattr(sync, "post_json", fake_post)
+
+    displays = [
+        {"device_id": "d1" * 8, "name": "one",   "address": "10.0.0.1", "port": 8080},
+        {"device_id": "d2" * 8, "name": "two",   "address": "10.0.0.2", "port": 8080},
+        {"device_id": "d3" * 8, "name": "three", "address": "10.0.0.3", "port": 8080},
+    ]
+    items = [{"type": "url", "seconds": 10, "ref": "https://example.com"}]
+    results = sync.push_targeted(displays, items, "Ctrl", "http://10.0.0.9:8080", SITE_KEY)
+
+    assert [r["name"] for r in results] == ["one", "two", "three"]   # order preserved
+    assert [r["ok"] for r in results] == [True, False, True]         # failure isolated
+    assert "error" in results[1]
+
+
+def test_push_targeted_empty_displays_returns_empty():
+    items = [{"type": "url", "seconds": 5, "ref": "x"}]
+    assert sync.push_targeted([], items, "C", "http://x:8080", SITE_KEY) == []
+
+
 # --- clear_received (take pushed content down from the display) --------------
 
 def test_clear_received_removes_playlist_and_assets(clean_data_dir):

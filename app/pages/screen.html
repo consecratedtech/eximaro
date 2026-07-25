@@ -572,7 +572,9 @@
     }, 60000);
 
     loadData();
-    setInterval(loadData, 10000);
+    // Poll fairly briskly so pushed content and edits appear within a few seconds.
+    // /api/screen-data is a cheap local call, so 3s is comfortable for a Pi.
+    setInterval(loadData, 3000);
   </script>
 </body>
 </html>

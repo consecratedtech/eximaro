@@ -235,20 +235,29 @@ def measure_slides(item_id: str) -> dict:
     of being cut off after one slide. No-op for non-Slides items or when the deck
     can't be measured (offline, markup change). Kept out of add_url so the
     library core stays pure and offline-testable."""
+    target = next((it for it in _load()
+                   if it["id"] == item_id and it.get("type") == "url"
+                   and _is_google_slides(it.get("ref", ""))), None)
+    if target is None:
+        return {}
+    # The slow part — a headless browser, up to ~45s — runs WITHOUT holding a library
+    # snapshot. We re-load fresh afterwards and patch only this one item, so any edit
+    # the operator makes during the measurement (this now runs as a background task)
+    # isn't clobbered by a stale write, and a deleted item is never resurrected.
+    n, per = _slides_plan(target["ref"])
+    if not (n and per):
+        return target
     items = _load()
     for it in items:
-        if it["id"] == item_id and it.get("type") == "url" and _is_google_slides(it.get("ref", "")):
-            n, per = _slides_plan(it["ref"])
-            if n and per:
-                it["slides"] = n
-                it["per_slide"] = per
-                # Size to show EVERY slide: deck time + a buffer for the initial
-                # load and Google's own timing drift. loop=true means the deck just
-                # keeps cycling through the buffer, so it's never cut off.
-                it["seconds"] = (n + 1) * per + 15
-                _save(items)
+        if it["id"] == item_id:
+            it["slides"] = n
+            it["per_slide"] = per
+            # Size to show EVERY slide: deck time + a buffer for the initial load and
+            # Google's own timing drift. loop=true keeps it cycling, so it's never cut off.
+            it["seconds"] = (n + 1) * per + 15
+            _save(items)
             return it
-    return {}
+    return {}   # removed while we were measuring — nothing to write back
 
 
 def add_image(filename: str, data: bytes, seconds: int = DEFAULT_IMAGE_SECONDS) -> dict:

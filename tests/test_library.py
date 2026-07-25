@@ -435,3 +435,46 @@ def test_add_video_path_moves_file_into_assets(tmp_path):
     assert item["seconds"] == 0
     assert not src.exists()  # moved, not copied (no RAM buffering of large files)
     assert library.asset_path(item["ref"]).read_bytes().startswith(b"\x1aE\xdf\xa3")
+
+
+# --- measure_slides: re-load after the slow step (no lost updates) -----------
+
+def test_measure_slides_reload_preserves_a_concurrent_edit(monkeypatch):
+    """The headless-browser sizing step now runs as an off-request background task,
+    so a content edit can land WHILE it runs. measure_slides must re-load the library
+    after the slow step and patch only its own item — never write back a stale
+    pre-browser snapshot that resurrects a since-removed item."""
+    monkeypatch.setattr(library, "_is_google_slides", lambda u: "deckmarker" in (u or ""))
+    deck = library.add_url("https://docs.google.com/presentation/deckmarker/pub", 15)
+    other = library.add_url("https://example.com/keep-me", 10)
+
+    # Stand in for the slow headless browser; a concurrent request removes 'other'
+    # in the middle of it, exactly the window that used to be clobbered.
+    def slow_plan(ref):
+        library.remove(other["id"])
+        return (3, 5)
+    monkeypatch.setattr(library, "_slides_plan", slow_plan)
+
+    library.measure_slides(deck["id"])
+
+    items = library.list_items()
+    ids = [i["id"] for i in items]
+    assert other["id"] not in ids                       # the concurrent removal survives
+    deck_now = next(i for i in items if i["id"] == deck["id"])
+    assert deck_now["slides"] == 3                       # the deck still got measured
+    assert deck_now["seconds"] == (3 + 1) * 5 + 15
+
+
+def test_measure_slides_does_not_resurrect_a_removed_deck(monkeypatch):
+    """If the very deck being measured is removed mid-measurement, its completed
+    measurement must not re-create it."""
+    monkeypatch.setattr(library, "_is_google_slides", lambda u: "deckmarker" in (u or ""))
+    deck = library.add_url("https://docs.google.com/presentation/deckmarker/pub", 15)
+
+    def slow_plan(ref):
+        library.remove(deck["id"])
+        return (4, 6)
+    monkeypatch.setattr(library, "_slides_plan", slow_plan)
+
+    assert library.measure_slides(deck["id"]) == {}     # nothing to write back
+    assert deck["id"] not in [i["id"] for i in library.list_items()]

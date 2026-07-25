@@ -78,6 +78,38 @@ def create_app() -> FastAPI:
         # controller keeps it on the /content page, a display on its home page.
         return "/content" if current().get("role") == "controller" else "/"
 
+    def _push_now() -> list:
+        """Send the current playlist to every paired display. Safe to run from a
+        background task: per-display network failures are captured in the result,
+        never raised."""
+        displays = pairing.list_displays()
+        if not displays:
+            return []
+        base_url = f"http://{discovery.primary_ip()}:{config.PORT}"
+        return sync.push_targeted(
+            displays, library.list_items(), current()["name"],
+            base_url, auth.get_or_create_site_key(),
+        )
+
+    def _autopush(background: BackgroundTasks) -> None:
+        """After a content change on a controller, push to the displays automatically
+        so an edit lands on the screens without anyone clicking 'Push'. It runs after
+        the response, so saving the change stays instant. A display never auto-pushes."""
+        if current().get("role") == "controller" and pairing.list_displays():
+            background.add_task(_push_now)
+
+    def _remeasure_and_push() -> None:
+        """Read the length of any Google Slides deck we couldn't size yet, then push
+        again if anything changed. Kept off the request path so 'Push' returns fast
+        instead of blocking on a headless browser."""
+        changed = False
+        for it in library.list_items():
+            if it["type"] == "url" and not it.get("slides") and library._is_google_slides(it.get("ref", "")):
+                library.measure_slides(it["id"])
+                changed = True
+        if changed:
+            _push_now()
+
     def _advertise_now(app: FastAPI) -> None:
         # Best-effort LAN advertisement so controllers can discover this device.
         # Discovery must never block or crash the app, so failures are swallowed.
@@ -119,6 +151,10 @@ def create_app() -> FastAPI:
     # the static files, the QR, and the login page itself.
     _OPEN_EXACT = {"/healthz", "/screen", "/api/screen-data", "/login", "/logout",
                    "/qr.png", "/favicon.ico",
+                   # Update progress is not sensitive (like /healthz) and MUST stay
+                   # readable across the mid-update restart, which wipes in-memory
+                   # sessions — otherwise the update overlay's poll would hang.
+                   "/api/update-status",
                    # WiFi setup: a phone joins the setup AP with no session, so these
                    # stay open. They only do anything while the Pi is hosting that AP.
                    "/wifi-setup", "/wifi-qr.png", "/wifi-open-qr.png",
@@ -534,11 +570,13 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
         # item just shows "length not read yet" with a Re-check button until it lands,
         # then updates itself. A non-Slides link makes measure_slides a no-op anyway.
         background.add_task(library.measure_slides, item["id"])
+        _autopush(background)   # measure runs first, then the push carries its timing
         activity.log("Added a link to the playlist", url)
         return RedirectResponse(_content_back(), status_code=303)
 
     @app.post("/api/content/upload")
-    async def add_upload(file: UploadFile, seconds: int = Form(library.DEFAULT_IMAGE_SECONDS)):
+    async def add_upload(background: BackgroundTasks, file: UploadFile,
+                         seconds: int = Form(library.DEFAULT_IMAGE_SECONDS)):
         name = file.filename or "upload"
         low = name.lower()
         # Stream the upload to a temp file in chunks so a large video is never held
@@ -578,50 +616,61 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
                     Path(tmp).unlink()
                 except OSError:
                     pass
+        # The file is fully processed by now (conversion is awaited above), so the
+        # pushed manifest references content that actually exists.
+        _autopush(background)
         return RedirectResponse(_content_back(), status_code=303)
 
     @app.post("/api/content/remove")
-    def remove_content(item_id: str = Form(...)):
+    def remove_content(background: BackgroundTasks, item_id: str = Form(...)):
         library.remove(item_id)
+        _autopush(background)
         activity.log("Removed an item from the playlist")
         return RedirectResponse(_content_back(), status_code=303)
 
     @app.post("/api/content/seconds")
-    def content_seconds(item_id: str = Form(...), seconds: int = Form(...)):
+    def content_seconds(background: BackgroundTasks, item_id: str = Form(...), seconds: int = Form(...)):
         library.set_seconds(item_id, seconds)
+        _autopush(background)
         return RedirectResponse(_content_back(), status_code=303)
 
     @app.post("/api/content/sound")
-    def content_sound(item_id: str = Form(...), sound: str = Form(default="")):
+    def content_sound(background: BackgroundTasks, item_id: str = Form(...), sound: str = Form(default="")):
         # The checkbox posts "on" when ticked, nothing when not — so its presence is
         # the value. A muted screen is the norm, so sound is off unless asked for.
         library.set_sound(item_id, sound == "on")
+        _autopush(background)
         return RedirectResponse(_content_back(), status_code=303)
 
     @app.post("/api/content/cc")
-    def content_cc(item_id: str = Form(...), cc: str = Form(default="")):
+    def content_cc(background: BackgroundTasks, item_id: str = Form(...), cc: str = Form(default="")):
         library.set_cc(item_id, cc == "on")
+        _autopush(background)
         return RedirectResponse(_content_back(), status_code=303)
 
     @app.post("/api/content/remeasure")
-    def content_remeasure(item_id: str = Form(...)):
+    def content_remeasure(background: BackgroundTasks, item_id: str = Form(...)):
         # Read a Google Slides deck's length now (it needs to be online). Lets a deck
         # that was added on a flaky connection size itself without re-adding it.
         item = library.measure_slides(item_id)
         if item.get("slides"):
             activity.log(f"Read a Google Slides deck — {item['slides']} slide(s)")
+        _autopush(background)
         return RedirectResponse(_content_back(), status_code=303)
 
     @app.post("/api/content/move")
-    def content_move(item_id: str = Form(...), direction: str = Form(...)):
+    def content_move(background: BackgroundTasks, item_id: str = Form(...), direction: str = Form(...)):
         if direction in ("up", "down"):
             library.move(item_id, direction)
+        _autopush(background)
         return RedirectResponse(_content_back(), status_code=303)
 
     @app.post("/api/content/targets")
-    def content_targets(item_id: str = Form(...), display: list[str] = Form(default=[])):
+    def content_targets(background: BackgroundTasks, item_id: str = Form(...),
+                        display: list[str] = Form(default=[])):
         # No displays checked = show on every screen; otherwise just the chosen ones.
         library.set_targets(item_id, display)
+        _autopush(background)
         activity.log("Changed which screens an item shows on")
         return RedirectResponse(_content_back(), status_code=303)
 
@@ -638,6 +687,14 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
         updater.request_update()
         activity.log("Started a software update")
         return RedirectResponse("/", status_code=303)
+
+    @app.get("/api/update-status")
+    def update_status():
+        # The update UI polls this so it can react to the ACTUAL outcome (done /
+        # failed / rolled_back) instead of guessing from /healthz — a failed update
+        # never restarts the app, so there's no restart to detect. `in_progress` is
+        # true only while a request file is still sitting unhandled.
+        return {"in_progress": updater.in_progress(), **updater.status()}
 
     @app.post("/api/promote")
     def promote_now():
@@ -745,22 +802,17 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
         return RedirectResponse("/", status_code=303)
 
     @app.post("/api/push")
-    def push():
+    def push(background: BackgroundTasks):
         displays = pairing.list_displays()
         if not displays:
             return {"results": [], "message": "No displays paired yet."}
-        # Best-effort: (re)measure any Google Slides deck we couldn't size yet, so a
-        # deck added on a slow/flaky connection still gets its full-deck timing.
-        for it in library.list_items():
-            if it["type"] == "url" and not it.get("slides") and library._is_google_slides(it.get("ref", "")):
-                library.measure_slides(it["id"])
-        base_url = f"http://{discovery.primary_ip()}:{config.PORT}"
-        # Each display gets only the items aimed at it (untargeted items go to all).
-        results = sync.push_targeted(
-            displays, library.list_items(), current()["name"], base_url, auth.get_or_create_site_key()
-        )
+        # Push now with whatever timing we have, so this returns immediately instead
+        # of blocking on a headless browser. Any Google Slides deck we couldn't size
+        # yet gets measured + re-pushed in the background.
+        results = _push_now()
         ok = sum(1 for r in results if r.get("ok"))
         activity.log(f"Pushed content to {ok} of {len(results)} display(s)")
+        background.add_task(_remeasure_and_push)
         return {"results": results}
 
     return app
@@ -1111,8 +1163,7 @@ def _settings_drawer(cfg: dict, role: str) -> str:
             staged and health-checked &mdash; if a new version doesn't start, the device
             rolls back to the previous one automatically.</p>
           {upd_line}
-          <form method="post" action="/api/update"
-                onsubmit="return confirm('Update to the latest version? The screen restarts briefly.');">
+          <form method="post" action="/api/update" onsubmit="startUpdate();return false;">
             <button class="btn-accent full" type="submit">Update now</button>
           </form>
         </div>"""
@@ -1269,6 +1320,68 @@ def _nav(active: str, role: str) -> str:
     return f'\n      <nav class="nav" aria-label="Sections">{tabs}</nav>\n    '
 
 
+# A full-screen "working…" overlay + helpers, dropped on every panel page. It gives
+# the operator immediate feedback on actions that otherwise look like nothing is
+# happening (adding a link, uploading, updating). Plain string (not an f-string) so
+# its CSS/JS braces stay literal.
+_WORKING_HTML = """
+  <div id="working" class="working" role="status" aria-live="polite" aria-hidden="true">
+    <div class="working-box"><div class="spinner"></div><div id="workingMsg">Working…</div></div>
+  </div>
+  <style>
+    .working{position:fixed;inset:0;z-index:200;display:none;align-items:center;justify-content:center;
+      background:rgba(10,12,14,.55)}
+    .working.on{display:flex}
+    .working-box{background:var(--surface,#fff);color:var(--ink,#17191C);border-radius:14px;
+      padding:24px 30px;display:flex;flex-direction:column;align-items:center;gap:14px;text-align:center;
+      font-weight:600;max-width:80vw;box-shadow:0 12px 44px rgba(0,0,0,.4)}
+    .spinner{width:34px;height:34px;border-radius:50%;border:3px solid var(--line,#E6E8EA);
+      border-top-color:var(--accent,#2F7FE0);animation:emxspin .8s linear infinite}
+    @keyframes emxspin{to{transform:rotate(360deg)}}
+    @media(prefers-reduced-motion:reduce){.spinner{animation-duration:2.4s}}
+  </style>
+  <script>
+    function showWorking(m){var w=document.getElementById('working');if(!w)return;
+      document.getElementById('workingMsg').textContent=m||'Working…';
+      w.classList.add('on');w.setAttribute('aria-hidden','false');}
+    function hideWorking(){var w=document.getElementById('working');if(!w)return;
+      w.classList.remove('on');w.setAttribute('aria-hidden','true');}
+    // Coming back via the back button (bfcache) must not leave a stale overlay up.
+    window.addEventListener('pageshow',hideWorking);
+    // Software update: poll the ACTUAL update status (not /healthz) so we react to
+    // the real outcome. A failed update never restarts the app, so there is no
+    // restart to detect — only the status says 'failed'. Must be called as
+    // onsubmit="startUpdate();return false;" — an async function returns a Promise,
+    // which is truthy, so `return startUpdate()` would NOT cancel the native submit.
+    async function startUpdate(){
+      if(!confirm('Update to the latest version? The screen restarts briefly.'))return false;
+      showWorking('Updating\\u2026 this can take a minute or two. The page refreshes when it is done.');
+      // Remember the previous status timestamp, so a stale result from a past update
+      // (e.g. a leftover 'done') can't make us reload before this update even starts.
+      var before='';
+      try{before=((await (await fetch('/api/update-status',{cache:'no-store'})).json())||{}).when||'';}catch(e){}
+      try{await fetch('/api/update',{method:'POST'});}catch(e){}
+      var tries=0;
+      var iv=setInterval(async function(){
+        tries++;
+        try{
+          var s=(await (await fetch('/api/update-status',{cache:'no-store'})).json())||{};
+          if(s.when&&s.when!==before){                 // a fresh status from THIS update
+            if(s.state==='done'){clearInterval(iv);location.reload();return;}
+            if(s.state==='failed'||s.state==='rolled_back'){
+              clearInterval(iv);hideWorking();
+              alert('Update did not complete: '+(s.detail||s.state));
+              location.reload();return;
+            }
+          }
+        }catch(e){}                              // the server may be restarting mid-swap
+        if(tries>150){clearInterval(iv);location.reload();}   // ~5 min hard cap
+      },2000);
+      return false;
+    }
+  </script>"""
+
+
 def _page(title: str, role: str, cfg: dict, body: str, active: str = "home") -> HTMLResponse:
     html = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -1284,6 +1397,7 @@ def _page(title: str, role: str, cfg: dict, body: str, active: str = "home") -> 
     {body}
   </main>
   {_settings_drawer(cfg, role)}
+  {_WORKING_HTML}
   {_SETTINGS_JS}
 </body></html>"""
     return HTMLResponse(html)
@@ -1561,7 +1675,7 @@ def _content_body(cfg: dict, displays=None) -> str:
         <h2>Add a web page, Google Slides, or video {_tip('slides')}</h2>
         <p class="hint">Paste a web address, a Google Slides &ldquo;Publish to web&rdquo;
           link, a YouTube link, or a direct video link.</p>
-        <form method="post" action="/api/content/url" class="row">
+        <form method="post" action="/api/content/url" class="row" onsubmit="showWorking('Adding the link…')">
           <input name="url" placeholder="https://…  ·  Google Slides link  ·  YouTube link" required>
           <input name="seconds" type="number" min="{library.MIN_SECONDS}" value="15" title="seconds on screen">
           <button class="btn-primary" type="submit">Add</button>
@@ -1579,7 +1693,7 @@ def _content_body(cfg: dict, displays=None) -> str:
         <p class="hint">A PowerPoint becomes <b>one</b> slideshow that plays all its
           slides in order; a video plays in full. The seconds box is how long each
           image or slide stays up.</p>
-        <form method="post" action="/api/content/upload" enctype="multipart/form-data" class="row">
+        <form method="post" action="/api/content/upload" enctype="multipart/form-data" class="row" onsubmit="showWorking('Uploading…')">
           <input name="file" type="file" accept="image/*,video/*,.pptx,.ppt" required>
           <input name="seconds" type="number" min="{library.MIN_SECONDS}" value="10" title="seconds per image or slide">
           <button class="btn-primary" type="submit">Upload</button>
@@ -1691,13 +1805,14 @@ def _control_home(cfg: dict) -> HTMLResponse:
       <div class="card">
         <h2>Push to all displays {_tip('push')}</h2>
         <p class="hint">Sends this controller's playlist to every paired display.</p>
-        <button class="btn-accent" onclick="pushAll()">Push to all displays</button>
+        <button class="btn-accent" onclick="pushAll(this)">Push to all displays</button>
         <div id="pushResult" class="hint tail"></div>
       </div>
       <script>
-      async function pushAll(){{
+      async function pushAll(btn){{
         const box=document.getElementById('pushResult');
         box.textContent='Sending…';
+        if(btn) btn.disabled=true;
         try{{
           const r=await fetch('/api/push',{{method:'POST'}});
           const d=await r.json();
@@ -1706,6 +1821,7 @@ def _control_home(cfg: dict) -> HTMLResponse:
           const fail=d.results.filter(x=>!x.ok);
           box.textContent=`Sent to ${{ok}} display(s).`+(fail.length?` Failed: ${{fail.map(f=>f.name).join(', ')}}.`:'');
         }}catch(e){{box.textContent='Push failed.';}}
+        finally{{if(btn) btn.disabled=false;}}
       }}
       </script>"""
 
