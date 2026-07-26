@@ -170,24 +170,124 @@ ok "data dir ${DATA_DIR} (0700 — secrets stay here, never world-readable)"
 # Intel/AMD HDMI — so the same setup works on both arches without hardcoding.
 step "Setting up audio (PipeWire -> HDMI)"
 APP_UID="$(id -u "$APP_USER")"
-cat > /usr/local/bin/${APP}-audio-hdmi <<'HDMI'
+AUDIO_CONF="/etc/${APP}/audio-sink"   # operator override: pin a specific output
+cat > /usr/local/bin/${APP}-audio-hdmi <<HDMI
 #!/bin/sh
 # Point the default sink at the display's audio output. Runs in the app user's
-# PipeWire session at login; matches the sink by name so it is not tied to a card
+# PipeWire session at login; matches the sink by NAME so it is not tied to a card
 # index. A Pi says "(HDMI)"; an x86 GPU says "HDMI n" or, for a DisplayPort
-# monitor, "DisplayPort" — so match both. (A USB-C dock that presents its audio
-# as a generic "USB Audio" device won't match; such a box needs a manual default.)
+# monitor, "DisplayPort" — so match both, and the same setup works on either arch.
+#
+# When that guess is wrong — a USB-C dock presenting itself as a generic
+# "USB Audio" device, an amplifier, a second HDMI port — an operator can PIN the
+# output by writing a sink id or a name fragment into:
+#
+#     ${AUDIO_CONF}
+#
+# Run "${APP}-audio-hdmi --list" to see the choices, then e.g.
+#     echo 'USB Audio' | sudo tee ${AUDIO_CONF} && sudo systemctl reboot
+#
+# Usage: ${APP}-audio-hdmi [--list | --status]
+AUDIO_CONF="${AUDIO_CONF}"
+APP_USER="${APP_USER}"
+APP_UID="${APP_UID}"
+HDMI
+cat >> /usr/local/bin/${APP}-audio-hdmi <<'HDMI'
+
+# Sound lives in the app user's PipeWire session, so wpctl only sees it from there.
+# Re-run as that user when an operator invokes this by hand (as root, or via sudo);
+# the systemd user service already runs as the app user and skips this.
+if [ "$(id -u)" != "$APP_UID" ]; then
+  exec sudo -u "$APP_USER" \
+    env XDG_RUNTIME_DIR="/run/user/$APP_UID" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$APP_UID/bus" "$0" "$@"
+fi
+
+# Every AUDIO sink as "<id> <name>". wpctl prints a "Sinks:" block under BOTH the
+# Audio and the Video section, so this is scoped to Audio — otherwise a camera or
+# other video node can be selected as the sound output. Box-drawing characters are
+# stripped so the ids parse on any locale.
+list_sinks() {
+  wpctl status 2>/dev/null | awk '
+    /^Audio$/ { a = 1; next }
+    /^Video$/ { a = 0 }
+    a && /Sinks:/ { s = 1; next }
+    a && /(Sources|Sink endpoints|Filters|Streams):/ { s = 0 }
+    a && s { print }
+  ' | sed 's/[^ -~]//g' \
+    | sed -n 's/^[^0-9]*\([0-9][0-9]*\)\.[[:space:]]*\(.*\)$/\1 \2/p' \
+    | sed 's/[[:space:]]*\[vol:.*$//'
+}
+
+# Resolve a pin (a numeric sink id, or a case-insensitive name fragment) to an id,
+# echoing nothing when it matches no CURRENT sink.
+resolve() {
+  case "$1" in
+    ''|*[!0-9]*) list_sinks | grep -iE -- "$1" | awk '{ print $1; exit }' ;;
+    *)           list_sinks | awk -v want="$1" '$1 == want { print $1; exit }' ;;
+  esac
+}
+
+case "$1" in
+  --list)
+    echo "Audio outputs this device can use:"; list_sinks | sed 's/^/  /'
+    [ -s "$AUDIO_CONF" ] && echo "Pinned in $AUDIO_CONF: $(cat "$AUDIO_CONF")"
+    exit 0 ;;
+  --status)
+    wpctl status 2>/dev/null | awk '/^Audio$/{a=1} /^Video$/{a=0} a' | head -20; exit 0 ;;
+esac
+
+# A pin wins over the HDMI guess. Read the first non-comment, non-blank line.
+PIN=""
+[ -r "$AUDIO_CONF" ] && PIN=$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$AUDIO_CONF" 2>/dev/null | head -1 \
+                              | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+# The display's sink can appear a little after the session starts (and not at all
+# while the TV is off), so poll briefly rather than give up on the first look.
+ID=""
 for _ in $(seq 1 30); do
-  ID=$(wpctl status 2>/dev/null | awk '/Sinks:/{s=1} /Sources:/{s=0} s' \
-        | grep -iE 'hdmi|displayport' | grep -oE '[0-9]+\.' | head -1 | tr -d '.')
+  if [ -n "$PIN" ]; then
+    ID=$(resolve "$PIN")
+  else
+    ID=$(list_sinks | grep -iE 'hdmi|displayport' | awk '{ print $1; exit }')
+  fi
   [ -n "$ID" ] && break
   sleep 1
 done
-[ -n "$ID" ] || exit 0            # no HDMI sink (no display yet) — leave the default
+
+if [ -z "$ID" ]; then
+  # Leave whatever PipeWire chose — silence is better than a hard failure, and the
+  # reason is in the journal for anyone troubleshooting.
+  if [ -n "$PIN" ]; then
+    echo "audio: nothing matches the pinned output '$PIN'; leaving the default. Choices:"
+    list_sinks | sed 's/^/  /'
+  else
+    echo "audio: no HDMI/DisplayPort output found (is the screen on?); leaving the default."
+  fi
+  exit 0
+fi
+
 wpctl set-default "$ID"
 wpctl set-volume "$ID" 1.0        # full at the sink; the TV's own volume still applies
+echo "audio: default output -> $(list_sinks | awk -v i="$ID" '$1 == i { $1 = ""; print }')"
 HDMI
 chmod 0755 /usr/local/bin/${APP}-audio-hdmi
+
+# Seed a commented placeholder so the override is discoverable on the device itself.
+# Never overwrite an operator's existing pin.
+install -d -m 0755 "$(dirname "${AUDIO_CONF}")"
+if [ ! -f "${AUDIO_CONF}" ]; then
+  cat > "${AUDIO_CONF}" <<CONF
+# Which audio output ${APP} should use, when the automatic "HDMI/DisplayPort"
+# choice is wrong (a USB-C dock, an amplifier, a second HDMI port).
+#
+# Put ONE line below: either a sink id, or part of its name (case-insensitive).
+# See the choices with:   ${APP}-audio-hdmi --list
+# Example:                USB Audio
+#
+# Leave this file with no active line to keep the automatic choice.
+CONF
+fi
 cat > /etc/systemd/user/${APP}-audio-hdmi.service <<UNIT
 [Unit]
 Description=Route ${APP} audio to the HDMI output
@@ -196,6 +296,8 @@ Wants=wireplumber.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# Tag the journal so an operator can read just this: journalctl -t ${APP}-audio-hdmi
+SyslogIdentifier=${APP}-audio-hdmi
 ExecStart=/usr/local/bin/${APP}-audio-hdmi
 [Install]
 WantedBy=default.target

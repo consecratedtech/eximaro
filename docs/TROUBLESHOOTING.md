@@ -97,8 +97,38 @@ sudo -u eximaro env XDG_RUNTIME_DIR=/run/user/$(id -u eximaro) wpctl status
 ```
 
 - ✅ **Good:** under **Sinks**, the line marked `*` (the default) is the **HDMI** one, and while a video with sound is playing you'll see a **`Chromium`** entry under **Streams** routed to it.
-- ⚠️ **The `*` is on "Analog"/"Headphones," not HDMI:** the routing service didn't pick HDMI. Reboot, or re‑run `sudo eximaro-update-full`. (It matches the sink named "HDMI" / "DisplayPort" automatically.)
+- ⚠️ **The `*` is on "Analog"/"Headphones," not HDMI:** the routing service didn't pick HDMI. Reboot, or re‑run `sudo eximaro-update-full`. (It matches the sink named "HDMI" / "DisplayPort" automatically.) If it still picks the wrong one, **pin the output** — see below.
 - ⚠️ **No `Chromium` stream at all while a video plays:** the video probably isn't set to play sound — in the panel, tick **"Play sound"** on that item. Also confirm the **TV isn't muted** and its volume is up. Sound is **off by default** on every item.
+
+### Choosing the audio output yourself (pinning a device)
+
+The device picks the output whose name contains **HDMI** or **DisplayPort**, which is
+right for a TV on nearly every Pi and PC. Some setups don't announce themselves that
+way — a **USB‑C dock**, an **amplifier or soundbar**, a **USB speaker**, or a machine
+with **two HDMI ports** — and there you tell it which one to use.
+
+See what this device can use:
+
+```
+eximaro-audio-hdmi --list
+```
+
+Then pin one, using either the number or any part of the name (whichever is easier):
+
+```
+echo 'USB Audio' | sudo tee /etc/eximaro/audio-sink
+sudo reboot
+```
+
+- The pin **wins over** the automatic HDMI choice, and survives updates and reboots.
+- To go back to automatic, empty the file: `sudo truncate -s 0 /etc/eximaro/audio-sink`
+- If the pin matches nothing (a dock was unplugged, a name changed), the device
+  **leaves the sound as‑is** rather than failing, and writes the reason plus the list
+  of real choices to the log:
+
+  ```
+  sudo journalctl -t eximaro-audio-hdmi -n 20 --no-pager
+  ```
 
 > Note: **YouTube needs internet every time it plays.** For sound/video that must survive an outage, **upload the video file** instead of linking YouTube.
 
