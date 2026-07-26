@@ -36,6 +36,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import (
     activity,
+    audio,
     auth,
     commands,
     config,
@@ -688,6 +689,21 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
         activity.log("Started a software update")
         return RedirectResponse("/", status_code=303)
 
+    @app.post("/api/audio")
+    def set_audio(output: str = Form(...)):
+        # The panel posts a sink id, or "auto" to go back to picking HDMI itself.
+        # A root path unit does the actual switch — the app can't write /etc.
+        audio.request(output)
+        activity.log("Changed the audio output"
+                     if output != audio.AUTO else "Set the audio output back to automatic")
+        return RedirectResponse("/", status_code=303)
+
+    @app.post("/api/audio/refresh")
+    def refresh_audio():
+        # Re-scan the hardware (e.g. a soundbar was just plugged in).
+        audio.refresh()
+        return RedirectResponse("/", status_code=303)
+
     @app.get("/api/update-status")
     def update_status():
         # The update UI polls this so it can react to the ACTUAL outcome (done /
@@ -1153,6 +1169,48 @@ def _settings_drawer(cfg: dict, role: str) -> str:
     else:
         display_here_section = ""
 
+    # Sound output: only worth showing once the helper has found real outputs.
+    a_state = audio.state()
+    if a_state["outputs"]:
+        pinned, current = a_state["pinned"], a_state["current"]
+        opts = ['<option value="auto"%s>Automatic (the TV over HDMI)</option>'
+                % ("" if pinned else " selected")]
+        for out in a_state["outputs"]:
+            # A pin can be an id or a name fragment, so match either way.
+            chosen = bool(pinned) and (pinned == out["id"] or pinned.lower() in out["name"].lower())
+            label = out["name"] + (" — in use now" if out["id"] == current else "")
+            opts.append('<option value="%s"%s>%s</option>'
+                        % (_esc(out["id"]), " selected" if chosen else "", _esc(label)))
+        stale = ('<p class="hint">Chosen output <b>%s</b> isn&rsquo;t available right now, so '
+                 'sound is playing through whatever the device found.</p>' % _esc(pinned)
+                 ) if pinned and not any(
+                     pinned == o["id"] or pinned.lower() in o["name"].lower()
+                     for o in a_state["outputs"]) else ""
+        audio_section = f"""
+        <div class="section">
+          <h3>Sound output</h3>
+          <p>Where videos with &ldquo;Play sound&rdquo; are heard. Automatic sends sound
+            to the TV over HDMI, which is right for nearly every setup &mdash; change it
+            for a soundbar, a headphone jack, or a second HDMI port.</p>
+          {stale}
+          <form method="post" action="/api/audio">
+            <select name="output" onchange="this.form.submit()">{''.join(opts)}</select>
+            <noscript><button class="btn-primary full" type="submit">Save</button></noscript>
+          </form>
+          <form method="post" action="/api/audio/refresh">
+            <button class="btn-ghost full" type="submit">Re-scan for outputs</button>
+          </form>
+        </div>"""
+    else:
+        audio_section = f"""
+        <div class="section">
+          <h3>Sound output</h3>
+          <p>No sound outputs found yet. Connect the screen (or a speaker) and re-scan.</p>
+          <form method="post" action="/api/audio/refresh">
+            <button class="btn-ghost full" type="submit">Re-scan for outputs</button>
+          </form>
+        </div>"""
+
     upd = updater.status()
     upd_line = (f'<p>Last update: <span class="now">{_esc(upd["state"])}</span> &mdash; '
                 f'{_esc(upd.get("detail", ""))}</p>') if upd.get("state") else ""
@@ -1215,6 +1273,8 @@ def _settings_drawer(cfg: dict, role: str) -> str:
         </div>
 
         {wifi_section}
+
+        {audio_section}
 
         <div class="section">
           <h3>Role <span class="tip" data-tip="{_esc(other_tip)}" aria-label="More info">i</span></h3>
@@ -1797,14 +1857,17 @@ def _promote_banner(conv: dict) -> str:
             f'<form method="post" action="/api/promote"><button class="btn-accent" type="submit">Install PowerPoint support</button></form></div>')
 
 
-def _control_home(cfg: dict) -> HTMLResponse:
-    # The screens hub: Push on top, then the paired displays and finding new ones.
-    # The content library lives on its own /content page now, not here.
-    banner = _promote_banner(promote.conversion_state())
-    push = f"""
+def _push_card() -> str:
+    """The manual "send it now" card. It lives on the Content page, next to the
+    playlist it sends — sending from a different tab than the one you edit on never
+    made sense. Content changes already push on their own; this is the re-send for
+    when a screen was off or unplugged at the time."""
+    return f"""
       <div class="card">
         <h2>Push to all displays {_tip('push')}</h2>
-        <p class="hint">Sends this controller's playlist to every paired display.</p>
+        <p class="hint">Changes go out to your displays on their own. Use this to
+          send the whole playlist again &mdash; handy if a screen was off or offline
+          when you last changed something.</p>
         <button class="btn-accent" onclick="pushAll(this)">Push to all displays</button>
         <div id="pushResult" class="hint tail"></div>
       </div>
@@ -1824,6 +1887,12 @@ def _control_home(cfg: dict) -> HTMLResponse:
         finally{{if(btn) btn.disabled=false;}}
       }}
       </script>"""
+
+
+def _control_home(cfg: dict) -> HTMLResponse:
+    # The screens hub: the paired displays and finding new ones. Push moved to the
+    # Content page (next to the playlist), and the library lives there too.
+    banner = _promote_banner(promote.conversion_state())
 
     displays = pairing.list_displays()
     if displays:
@@ -1891,12 +1960,12 @@ def _control_home(cfg: dict) -> HTMLResponse:
     intro = f"""
       <p class="eyebrow">This device runs the controls {_tip('controller')}</p>
       <h1>Screens</h1>
-      <p class="lead">Push your content out to your displays, and manage which
-        screens are connected. Build the playlist itself on the Content tab.</p>
+      <p class="lead">Manage which screens are connected. Build the playlist &mdash;
+        and send it out &mdash; on the Content tab.</p>
     """
-    # The playlist lives on its own Content page now; the home page is the screens
-    # hub — push, the paired displays, and finding new ones to pair.
-    return _page("Screens", "controller", cfg, intro + banner + push + find)
+    # The playlist and its Push button both live on the Content page now; this page
+    # is purely the screens hub — the paired displays and finding new ones to pair.
+    return _page("Screens", "controller", cfg, intro + banner + find)
 
 
 def _content_page(cfg: dict, device_id: str = "") -> HTMLResponse:
@@ -1907,5 +1976,8 @@ def _content_page(cfg: dict, device_id: str = "") -> HTMLResponse:
     targetable = ([{"device_id": device_id, "name": cfg["name"] + " · this screen"}] + displays) if displays else []
     intro = ('<p class="eyebrow">Playlist &amp; media</p><h1>Content</h1>'
              '<p class="lead">Add links and uploads, then arrange the order and '
-             'timing. Push it to your displays from the Screens tab.</p>')
-    return _page("Content", role, cfg, intro + _content_body(cfg, targetable), active="content")
+             'timing. Changes go out to your displays automatically.</p>')
+    # Push sits with the playlist it sends. Only a controller with somewhere to send
+    # to gets the card — on a lone controller or a display it would do nothing.
+    push = _push_card() if (role == "controller" and displays) else ""
+    return _page("Content", role, cfg, intro + _content_body(cfg, targetable) + push, active="content")

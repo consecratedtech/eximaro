@@ -239,12 +239,27 @@ PIN=""
 [ -r "$AUDIO_CONF" ] && PIN=$(LC_ALL=C sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$AUDIO_CONF" 2>/dev/null | head -1 \
                               | LC_ALL=C sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 
+# The id of the sink PipeWire is using now (wpctl marks it with a "*").
+current_sink() {
+  wpctl status 2>/dev/null | LC_ALL=C awk '
+    /^Audio$/ { a = 1; next }
+    /^Video$/ { a = 0 }
+    a && /Sinks:/ { s = 1; next }
+    a && /(Sources|Sink endpoints|Filters|Streams):/ { s = 0 }
+    a && s { print }
+  ' | LC_ALL=C sed 's/[^ -~]//g' | LC_ALL=C grep '\*' \
+    | LC_ALL=C sed -n 's/^[^0-9]*\([0-9][0-9]*\)\..*$/\1/p' | head -1
+}
+
 case "$1" in
   --list)
     echo "Audio outputs this device can use:"; list_sinks | sed 's/^/  /'
     [ -n "$PIN" ] && echo "Pinned to: $PIN   (in $AUDIO_CONF)"
     [ -z "$PIN" ] && echo "No pin set — choosing HDMI/DisplayPort automatically."
     exit 0 ;;
+  --raw)     list_sinks; exit 0 ;;          # "<id> <name>" per line, for the panel
+  --current) current_sink; exit 0 ;;        # id of the sink in use right now
+  --pin)     printf '%s\n' "$PIN"; exit 0 ;;
   --status)
     wpctl status 2>/dev/null | LC_ALL=C awk '/^Audio$/{a=1} /^Video$/{a=0} a' | head -20; exit 0 ;;
 esac
@@ -560,6 +575,91 @@ WantedBy=multi-user.target
 EOF
 ok "promotion helper installed (watches for a switch to the controller role)"
 
+# ---- audio-output helper (panel picks the output; root applies it) ----------
+# The app is sandboxed and can only write ${DATA_DIR}, so it cannot touch
+# ${AUDIO_CONF} itself. Same shape as the promote/update helpers: the panel drops a
+# request file, this root path unit applies it and writes back the current state for
+# the panel to render. The request only ever names an audio output — it can never
+# turn into an arbitrary command.
+step "Installing the audio-output helper"
+cat > "/usr/local/sbin/${APP}-audio" <<EOF
+#!/usr/bin/env bash
+set -u
+DATA_DIR="${DATA_DIR}"; APP_USER="${APP_USER}"; APP_UID="${APP_UID}"
+AUDIO_CONF="${AUDIO_CONF}"; HELPER="/usr/local/bin/${APP}-audio-hdmi"
+EOF
+cat >> "/usr/local/sbin/${APP}-audio" <<'EOF'
+REQ="${DATA_DIR}/audio.request"; STATE="${DATA_DIR}/audio.state"
+
+# Read and consume the request up front, so a malformed one can never loop.
+WANT="$(head -c 200 "$REQ" 2>/dev/null | tr -d '\r\n')"
+rm -f "$REQ"
+
+# Everything audio has to run inside the app user's PipeWire session.
+as_app() {
+  sudo -u "$APP_USER" env XDG_RUNTIME_DIR="/run/user/${APP_UID}" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${APP_UID}/bus" "$@"
+}
+
+case "$WANT" in
+  ""|refresh) ;;                                  # just re-read the state below
+  auto)  : > "$AUDIO_CONF"                        # clear the pin -> automatic HDMI
+         as_app "$HELPER" >/dev/null 2>&1 ;;
+  *)     printf '%s\n' "$WANT" > "$AUDIO_CONF"    # pin this output
+         as_app "$HELPER" >/dev/null 2>&1 ;;
+esac
+
+# Publish what the device can actually do, for the panel to render. Built with
+# python3 so an output name containing quotes can't produce broken JSON.
+OUTPUTS="$(as_app "$HELPER" --raw    2>/dev/null)"
+CURRENT="$(as_app "$HELPER" --current 2>/dev/null)"
+PINNED="$( as_app "$HELPER" --pin     2>/dev/null)"
+OUTPUTS="$OUTPUTS" CURRENT="$CURRENT" PINNED="$PINNED" python3 - <<'PY' > "$STATE".tmp
+import json, os
+outputs = []
+for line in os.environ.get("OUTPUTS", "").splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    sink_id, _, name = line.partition(" ")
+    if sink_id.isdigit():
+        outputs.append({"id": sink_id, "name": name.strip()})
+print(json.dumps({
+    "outputs": outputs,
+    "current": os.environ.get("CURRENT", "").strip(),
+    "pinned": os.environ.get("PINNED", "").strip(),
+}))
+PY
+mv -f "$STATE".tmp "$STATE"
+chown "$APP_USER":"$APP_USER" "$STATE" 2>/dev/null || true
+EOF
+chmod 0755 "/usr/local/sbin/${APP}-audio"
+
+cat > "/etc/systemd/system/${APP}-audio.service" <<EOF
+[Unit]
+Description=${APP} audio-output change (apply the output chosen in the panel)
+
+[Service]
+Type=oneshot
+SyslogIdentifier=${APP}-audio
+ExecStart=/usr/local/sbin/${APP}-audio
+EOF
+
+cat > "/etc/systemd/system/${APP}-audio.path" <<EOF
+[Unit]
+Description=${APP} audio-output watcher
+
+[Path]
+PathExists=${DATA_DIR}/audio.request
+Unit=${APP}-audio.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+# Seed the state now so the panel has something to show on first open.
+/usr/local/sbin/${APP}-audio >/dev/null 2>&1 || true
+ok "audio-output helper installed (the panel can pick HDMI, headphones, etc.)"
+
 # ---- self-update helper (staged A/B swap with health-checked rollback) -------
 # 'Update now' in the UI drops an update.request file; this root path unit builds
 # the new version into its own release dir, swaps the ${APP_HOME} symlink to it
@@ -692,7 +792,7 @@ EOF
 ok "WiFi setup helper installed (scan, host the setup network, join a chosen one)"
 
 systemctl daemon-reload
-systemctl enable "${APP}.service" "${APP}-kiosk.service" "${APP}-promote.path" "${APP}-update.path" "${APP}-wifi.path" >/dev/null 2>&1 || true
+systemctl enable "${APP}.service" "${APP}-kiosk.service" "${APP}-promote.path" "${APP}-update.path" "${APP}-wifi.path" "${APP}-audio.path" >/dev/null 2>&1 || true
 # Use restart (not just enable --now) so re-running the installer to UPDATE
 # actually loads the new code — enable --now is a no-op on an already-running unit.
 systemctl restart "${APP}.service"       >/dev/null 2>&1 || warn "could not start ${APP}.service yet (app code may be incomplete)"
@@ -700,6 +800,7 @@ systemctl restart "${APP}-kiosk.service" >/dev/null 2>&1 || warn "could not star
 systemctl restart "${APP}-promote.path"  >/dev/null 2>&1 || true
 systemctl restart "${APP}-update.path"   >/dev/null 2>&1 || true
 systemctl restart "${APP}-wifi.path"     >/dev/null 2>&1 || true
+systemctl restart "${APP}-audio.path"    >/dev/null 2>&1 || true
 
 # ---- done -------------------------------------------------------------------
 step "Done"
