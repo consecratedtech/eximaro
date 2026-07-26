@@ -296,9 +296,15 @@ HDMI
 chmod 0755 /usr/local/bin/${APP}-audio-hdmi
 
 # Seed a commented placeholder so the override is discoverable on the device itself.
-# Never overwrite an operator's existing pin.
+# Re-seed when the explanation is missing too (an older device, or a file that got
+# emptied), carrying any pin already set across — so every device converges on a
+# self-explaining file without an operator's choice ever being lost.
 install -d -m 0755 "$(dirname "${AUDIO_CONF}")"
-if [ ! -f "${AUDIO_CONF}" ]; then
+if [ ! -f "${AUDIO_CONF}" ] || ! grep -q '^# Which audio output' "${AUDIO_CONF}" 2>/dev/null; then
+  _keep=""
+  if [ -f "${AUDIO_CONF}" ]; then
+    _keep="$(grep -vE '^[[:space:]]*(#|$)' "${AUDIO_CONF}" 2>/dev/null | head -1 || true)"
+  fi
   cat > "${AUDIO_CONF}" <<CONF
 # Which audio output ${APP} should use, when the automatic "HDMI/DisplayPort"
 # choice is wrong (a USB-C dock, an amplifier, a second HDMI port).
@@ -309,6 +315,7 @@ if [ ! -f "${AUDIO_CONF}" ]; then
 #
 # Leave this file with no active line to keep the automatic choice.
 CONF
+  [ -n "$_keep" ] && printf '%s\n' "$_keep" >> "${AUDIO_CONF}"   # keep an existing pin
 fi
 cat > /etc/systemd/user/${APP}-audio-hdmi.service <<UNIT
 [Unit]
