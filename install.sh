@@ -349,7 +349,11 @@ StandardError=journal
 UtmpIdentifier=tty1
 UtmpMode=user
 # cage (wlroots) needs XDG_RUNTIME_DIR; enable-linger (above) creates /run/user/<uid>.
-Environment=XDG_RUNTIME_DIR=/run/user/%U
+# The uid is written in literally: systemd's %U does NOT mean "the User= uid" here —
+# it resolves to the service manager's uid (0), so /run/user/%U pointed at root's
+# runtime dir, which does not exist and the app user could never write. That also
+# aimed the kiosk away from the PipeWire sockets in the app user's own runtime dir.
+Environment=XDG_RUNTIME_DIR=/run/user/${APP_UID}
 Environment=XDG_SESSION_TYPE=wayland
 # Hide the pointer: software cursors + the blank "default" theme (installed above)
 # make it invisible. cage otherwise draws a GPU hardware cursor that ignores the
@@ -364,16 +368,23 @@ Environment=XCURSOR_SIZE=24
 # Chromium loads too early, gets ERR_CONNECTION_REFUSED, and never retries. On
 # timeout this exits non-zero so Restart=always retries the whole unit.
 ExecStartPre=/bin/sh -c 'for i in \$(seq 1 60); do curl -sf http://localhost:${WEB_PORT}/healthz >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
-# --user-data-dir: give Chromium an explicit, writable profile dir. Newer Chromium
-# (e.g. a freshly-updated Pi 5) otherwise can't place its crash-handler database
-# and aborts on launch ("chrome_crashpad_handler: --database is required",
-# SIGABRT/134, restart-looping). %U is the app user's uid; /run/user/%U is its
-# tmpfs runtime dir — always writable, and a throwaway profile suits a kiosk.
+# --user-data-dir: give Chromium an explicit, writable profile dir. Without one it
+# can't place its crash-handler database and aborts on launch
+# ("chrome_crashpad_handler: --database is required", SIGABRT/134, restart-looping).
+# RuntimeDirectory= makes systemd create /run/${APP}-kiosk owned by User= BEFORE
+# ExecStart and remove it on stop: guaranteed to exist with the right owner, with no
+# dependency on logind having set up a runtime dir yet, and a throwaway profile suits
+# a kiosk. (An earlier version used /run/user/%U here, but %U resolves to 0 — root's
+# runtime dir — which the app user cannot write; Chromium then silently fell back to
+# a home-dir profile, so it "worked" on any device whose app-user home was writable
+# and hard-crash-looped on one where it wasn't.)
+RuntimeDirectory=${APP}-kiosk
+RuntimeDirectoryMode=0700
 ExecStart=/usr/bin/cage -- ${CHROMIUM_PKG} \\
   --kiosk --noerrdialogs --disable-infobars --incognito \\
   --check-for-update-interval=31536000 \\
   --autoplay-policy=no-user-gesture-required \\
-  --user-data-dir=/run/user/%U/chromium \\
+  --user-data-dir=/run/${APP}-kiosk/chromium \\
   http://localhost:${WEB_PORT}/screen
 Restart=always
 RestartSec=3
