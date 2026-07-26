@@ -603,10 +603,19 @@ as_app() {
 
 case "$WANT" in
   ""|refresh) ;;                                  # just re-read the state below
-  auto)  : > "$AUDIO_CONF"                        # clear the pin -> automatic HDMI
-         as_app "$HELPER" >/dev/null 2>&1 ;;
-  *)     printf '%s\n' "$WANT" > "$AUDIO_CONF"    # pin this output
-         as_app "$HELPER" >/dev/null 2>&1 ;;
+  auto)
+    # Back to choosing automatically. Comment the pin out rather than emptying the
+    # file: the comments in it are how someone reading the device over SSH learns
+    # what the file is for, and the installer won't re-seed a file that exists.
+    [ -f "$AUDIO_CONF" ] && sed -i 's/^[[:space:]]*\([^#[:space:]].*\)$/# (cleared) \1/' "$AUDIO_CONF"
+    as_app "$HELPER" >/dev/null 2>&1 ;;
+  *)
+    # Pin this output, keeping the explanatory comments above it.
+    if [ -f "$AUDIO_CONF" ]; then
+      sed -i 's/^[[:space:]]*\([^#[:space:]].*\)$/# (replaced) \1/' "$AUDIO_CONF"
+    fi
+    printf '%s\n' "$WANT" >> "$AUDIO_CONF"
+    as_app "$HELPER" >/dev/null 2>&1 ;;
 esac
 
 # Publish what the device can actually do, for the panel to render. Built with
