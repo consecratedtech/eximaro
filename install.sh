@@ -207,40 +207,47 @@ fi
 # Audio and the Video section, so this is scoped to Audio — otherwise a camera or
 # other video node can be selected as the sound output. Box-drawing characters are
 # stripped so the ids parse on any locale.
+# LC_ALL=C on the text steps is REQUIRED, not tidiness: wpctl draws the tree with
+# box characters, and under a UTF-8 locale GNU sed reads [^ -~] as a collation range
+# rather than the ASCII bytes — it then eats the digits and letters too, leaving no
+# sinks at all (silently: every device would fall back to "no output found").
 list_sinks() {
-  wpctl status 2>/dev/null | awk '
+  wpctl status 2>/dev/null | LC_ALL=C awk '
     /^Audio$/ { a = 1; next }
     /^Video$/ { a = 0 }
     a && /Sinks:/ { s = 1; next }
     a && /(Sources|Sink endpoints|Filters|Streams):/ { s = 0 }
     a && s { print }
-  ' | sed 's/[^ -~]//g' \
-    | sed -n 's/^[^0-9]*\([0-9][0-9]*\)\.[[:space:]]*\(.*\)$/\1 \2/p' \
-    | sed 's/[[:space:]]*\[vol:.*$//'
+  ' | LC_ALL=C sed 's/[^ -~]//g' \
+    | LC_ALL=C sed -n 's/^[^0-9]*\([0-9][0-9]*\)\.[[:space:]]*\(.*\)$/\1 \2/p' \
+    | LC_ALL=C sed 's/[[:space:]]*\[vol:.*$//'
 }
 
 # Resolve a pin (a numeric sink id, or a case-insensitive name fragment) to an id,
 # echoing nothing when it matches no CURRENT sink.
 resolve() {
   case "$1" in
-    ''|*[!0-9]*) list_sinks | grep -iE -- "$1" | awk '{ print $1; exit }' ;;
+    ''|*[!0-9]*) list_sinks | LC_ALL=C grep -iE -- "$1" | awk '{ print $1; exit }' ;;
     *)           list_sinks | awk -v want="$1" '$1 == want { print $1; exit }' ;;
   esac
 }
 
+# A pin wins over the HDMI guess. The file ships full of comments explaining itself,
+# so read the first line that is neither a comment nor blank — an untouched file
+# leaves this empty, which means "keep choosing automatically".
+PIN=""
+[ -r "$AUDIO_CONF" ] && PIN=$(LC_ALL=C sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$AUDIO_CONF" 2>/dev/null | head -1 \
+                              | LC_ALL=C sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
 case "$1" in
   --list)
     echo "Audio outputs this device can use:"; list_sinks | sed 's/^/  /'
-    [ -s "$AUDIO_CONF" ] && echo "Pinned in $AUDIO_CONF: $(cat "$AUDIO_CONF")"
+    [ -n "$PIN" ] && echo "Pinned to: $PIN   (in $AUDIO_CONF)"
+    [ -z "$PIN" ] && echo "No pin set — choosing HDMI/DisplayPort automatically."
     exit 0 ;;
   --status)
-    wpctl status 2>/dev/null | awk '/^Audio$/{a=1} /^Video$/{a=0} a' | head -20; exit 0 ;;
+    wpctl status 2>/dev/null | LC_ALL=C awk '/^Audio$/{a=1} /^Video$/{a=0} a' | head -20; exit 0 ;;
 esac
-
-# A pin wins over the HDMI guess. Read the first non-comment, non-blank line.
-PIN=""
-[ -r "$AUDIO_CONF" ] && PIN=$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$AUDIO_CONF" 2>/dev/null | head -1 \
-                              | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 
 # The display's sink can appear a little after the session starts (and not at all
 # while the TV is off), so poll briefly rather than give up on the first look.
