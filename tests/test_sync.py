@@ -195,6 +195,29 @@ def test_push_targeted_preserves_order_and_isolates_failures(monkeypatch):
     assert "error" in results[1]
 
 
+def test_shuffle_travels_with_the_pushed_playlist(clean_data_dir):
+    """Shuffle belongs to the playlist, not to the screen showing it — a display
+    playing pushed content must play it the way the controller asked."""
+    items = [{"type": "url", "seconds": 10, "ref": "https://example.com"}]
+    manifest = sync.build_manifest(items, "Ctrl", "http://c:8080", shuffle=True)
+    assert manifest["shuffle"] is True
+    sig = commands.sign(SITE_KEY, sync.canon(manifest))
+    assert sync.receive(manifest, sig, SITE_KEY)
+    assert sync.screen_shuffle() is True
+
+
+def test_a_playlist_pushed_without_shuffle_plays_in_order(clean_data_dir):
+    # Also covers a manifest from a controller older than the shuffle field.
+    manifest = {"items": [], "from": "Old"}
+    sig = commands.sign(SITE_KEY, sync.canon(manifest))
+    assert sync.receive(manifest, sig, SITE_KEY)
+    assert sync.screen_shuffle() is False
+
+
+def test_screen_shuffle_is_false_when_nothing_was_pushed(clean_data_dir):
+    assert sync.screen_shuffle() is False
+
+
 def test_push_targeted_empty_displays_returns_empty():
     items = [{"type": "url", "seconds": 5, "ref": "x"}]
     assert sync.push_targeted([], items, "C", "http://x:8080", SITE_KEY) == []

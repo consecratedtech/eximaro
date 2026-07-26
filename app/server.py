@@ -90,6 +90,7 @@ def create_app() -> FastAPI:
         return sync.push_targeted(
             displays, library.list_items(), current()["name"],
             base_url, auth.get_or_create_site_key(),
+            shuffle=bool(current().get("shuffle")),
         )
 
     def _autopush(background: BackgroundTasks) -> None:
@@ -374,8 +375,12 @@ def create_app() -> FastAPI:
         # display's job), so it always uses its own library — a stray received.json
         # can't blank its screen.
         pushed = None if is_controller else sync.screen_items()
+        # Pushed content plays the way the controller asked, including its shuffle —
+        # that setting belongs to the playlist, not to the screen showing it.
+        shuffle = bool(cfg.get("shuffle"))
         if pushed is not None:
             items = pushed
+            shuffle = sync.screen_shuffle()
         elif show_here:
             items = []
             for item in sync.items_for_display(library.list_items(), device_id):
@@ -414,7 +419,7 @@ def create_app() -> FastAPI:
         return {
             "items": items,
             "pairing_code": pairing.current_code(),
-            "shuffle": bool(cfg.get("shuffle")),
+            "shuffle": shuffle,
             # Where to reach this device: every interface, labeled, Wi-Fi first, so a
             # wired + Wi-Fi box shows both and you use whichever network you're on.
             # connect_url (and the QR) is the first one; null means no network yet.
@@ -676,10 +681,13 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
         return RedirectResponse(_content_back(), status_code=303)
 
     @app.post("/api/playback")
-    def set_playback(shuffle: str = Form(default="")):
+    def set_playback(background: BackgroundTasks, shuffle: str = Form(default="")):
         cfg = current()
         cfg["shuffle"] = bool(shuffle)
         config.save_config(cfg)
+        # Shuffle sits with the playlist, so it has to travel like the rest of it —
+        # the Content page promises changes reach the displays on their own.
+        _autopush(background)
         activity.log("Shuffle turned " + ("on" if cfg["shuffle"] else "off"))
         return RedirectResponse(_content_back(), status_code=303)
 
@@ -691,11 +699,14 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
 
     @app.post("/api/audio")
     def set_audio(output: str = Form(...)):
-        # The panel posts a sink id, or "auto" to go back to picking HDMI itself.
-        # A root path unit does the actual switch — the app can't write /etc.
-        audio.request(output)
-        activity.log("Changed the audio output"
-                     if output != audio.AUTO else "Set the audio output back to automatic")
+        # The panel posts an output the device reported, or "auto" to go back to
+        # picking HDMI itself. A root path unit does the switch — the app can't
+        # write /etc. Anything the device didn't report is refused rather than
+        # written, so a stale page can't pin something unusable.
+        if not audio.request_output(output):
+            return RedirectResponse("/", status_code=303)
+        activity.log("Set the audio output back to automatic" if output == audio.AUTO
+                     else "Changed the audio output")
         return RedirectResponse("/", status_code=303)
 
     @app.post("/api/audio/refresh")
@@ -793,6 +804,7 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
 
     @app.post("/api/displays/add")
     def displays_add(
+        background: BackgroundTasks,
         address: str = Form(...),
         code: str = Form(...),
         port: int = Form(8080),
@@ -809,6 +821,9 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
             activity.log("A pairing attempt failed", str(exc))
             return JSONResponse({"error": f"Could not pair: {exc}"}, status_code=400)
         activity.log("Paired a display", record.get("name") or address)
+        # Send it the playlist straight away, so a freshly paired screen starts
+        # playing instead of sitting blank until the next content change.
+        _autopush(background)
         return RedirectResponse("/", status_code=303)
 
     @app.post("/api/displays/remove")
@@ -1169,30 +1184,53 @@ def _settings_drawer(cfg: dict, role: str) -> str:
     else:
         display_here_section = ""
 
-    # Sound output: only worth showing once the helper has found real outputs.
+    # Sound output. The switch is done by a privileged helper, so what this can offer
+    # depends on whether that helper is installed and what it last reported.
     a_state = audio.state()
-    if a_state["outputs"]:
+
+    def _matches(pin: str, out: dict) -> bool:
+        # Mirror the helper's own order: exact id, exact name, then a case-insensitive
+        # part of a name. Keeping these in step is what makes the ticked option the
+        # one the device will actually use.
+        return bool(pin) and (pin == out["id"] or pin == out["name"]
+                              or pin.lower() in out["name"].lower())
+
+    if not audio.installed():
+        # In-app "Update now" only replaces app code, so a device updated that way has
+        # the picker but not the helper behind it. Say so instead of offering a
+        # control that would silently do nothing.
+        audio_section = """
+        <div class="section">
+          <h3>Sound output</h3>
+          <p>Sound still plays through the TV over HDMI. To choose a different output
+            from here, this device needs a full update &mdash; run
+            <span class="now">sudo eximaro-update-full</span> on it once.</p>
+        </div>"""
+    elif a_state["outputs"]:
         pinned, current = a_state["pinned"], a_state["current"]
+        matched = [o for o in a_state["outputs"] if _matches(pinned, o)]
+        chosen = matched[0] if matched else None   # the helper takes the first match too
         opts = ['<option value="auto"%s>Automatic (the TV over HDMI)</option>'
                 % ("" if pinned else " selected")]
         for out in a_state["outputs"]:
-            # A pin can be an id or a name fragment, so match either way.
-            chosen = bool(pinned) and (pinned == out["id"] or pinned.lower() in out["name"].lower())
             label = out["name"] + (" — in use now" if out["id"] == current else "")
             opts.append('<option value="%s"%s>%s</option>'
-                        % (_esc(out["id"]), " selected" if chosen else "", _esc(label)))
-        stale = ('<p class="hint">Chosen output <b>%s</b> isn&rsquo;t available right now, so '
-                 'sound is playing through whatever the device found.</p>' % _esc(pinned)
-                 ) if pinned and not any(
-                     pinned == o["id"] or pinned.lower() in o["name"].lower()
-                     for o in a_state["outputs"]) else ""
+                        % (_esc(out["name"]),
+                           " selected" if out is chosen else "",
+                           _esc(label)))
+        note = ""
+        if pinned and chosen is None:
+            note = ('<p class="hint">Chosen output <b>%s</b> isn&rsquo;t available right now, '
+                    'so sound is playing through whatever the device found.</p>' % _esc(pinned))
+        elif audio.pending():
+            note = '<p class="hint">Applying&hellip; reopen Settings in a moment to confirm.</p>'
         audio_section = f"""
         <div class="section">
           <h3>Sound output</h3>
           <p>Where videos with &ldquo;Play sound&rdquo; are heard. Automatic sends sound
             to the TV over HDMI, which is right for nearly every setup &mdash; change it
             for a soundbar, a headphone jack, or a second HDMI port.</p>
-          {stale}
+          {note}
           <form method="post" action="/api/audio">
             <select name="output" onchange="this.form.submit()">{''.join(opts)}</select>
             <noscript><button class="btn-primary full" type="submit">Save</button></noscript>
@@ -1202,7 +1240,7 @@ def _settings_drawer(cfg: dict, role: str) -> str:
           </form>
         </div>"""
     else:
-        audio_section = f"""
+        audio_section = """
         <div class="section">
           <h3>Sound output</h3>
           <p>No sound outputs found yet. Connect the screen (or a speaker) and re-scan.</p>

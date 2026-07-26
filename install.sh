@@ -223,13 +223,23 @@ list_sinks() {
     | LC_ALL=C sed 's/[[:space:]]*\[vol:.*$//'
 }
 
-# Resolve a pin (a numeric sink id, or a case-insensitive name fragment) to an id,
-# echoing nothing when it matches no CURRENT sink.
+# Resolve a pin to a sink id, echoing nothing when it matches no CURRENT sink.
+# A pin is matched, in order: an exact id, then an exact name, then a
+# case-insensitive part of a name. Names are matched LITERALLY (grep -F) — a real
+# output is called things like "Built-in Audio Digital Stereo (HDMI)", and those
+# parentheses are regex syntax, so a regex match would fail to find the very device
+# the panel just listed.
 resolve() {
+  [ -n "$1" ] || return 0
   case "$1" in
-    ''|*[!0-9]*) list_sinks | LC_ALL=C grep -iE -- "$1" | awk '{ print $1; exit }' ;;
-    *)           list_sinks | awk -v want="$1" '$1 == want { print $1; exit }' ;;
+    ''|*[!0-9]*) ;;                                          # not an id — fall through
+    *) list_sinks | awk -v want="$1" '$1 == want { print $1; exit }' | grep . && return 0 ;;
   esac
+  # Exact name first, so a short name can never be swallowed by a longer one that
+  # merely contains it; then the looser hand-written fragment.
+  list_sinks | awk -v want="$1" '{ name = substr($0, index($0, " ") + 1) }
+                                 name == want { print $1; exit }' | grep . && return 0
+  list_sinks | LC_ALL=C grep -iF -- "$1" | awk '{ print $1; exit }'
 }
 
 # A pin wins over the HDMI guess. The file ships full of comments explaining itself,
@@ -548,7 +558,9 @@ set -u
 DATA_DIR="${DATA_DIR}"
 STATUS="\${DATA_DIR}/promote.status"
 REQ="\${DATA_DIR}/promote.request"
-status(){ printf '{"state":"%s","detail":"%s","when":"%s"}\n' "\$1" "\$2" "\$(date -Is)" >"\$STATUS"; chown ${APP_USER}:${APP_USER} "\$STATUS" 2>/dev/null || true; }
+# rm first + chown -h: this runs as root on a path the unprivileged app user owns,
+# so a symlink planted there must not redirect a root write, nor hand its target away.
+status(){ rm -f "\$STATUS" 2>/dev/null; printf '{"state":"%s","detail":"%s","when":"%s"}\n' "\$1" "\$2" "\$(date -Is)" >"\$STATUS"; chown -h ${APP_USER}:${APP_USER} "\$STATUS" 2>/dev/null || true; }
 status running "installing PowerPoint conversion packages"
 export DEBIAN_FRONTEND=noninteractive
 if apt-get update -qq && apt-get install -y --no-install-recommends ${CONTROLLER_PKGS}; then
@@ -598,6 +610,16 @@ EOF
 cat >> "/usr/local/sbin/${APP}-audio" <<'EOF'
 REQ="${DATA_DIR}/audio.request"; STATE="${DATA_DIR}/audio.state"
 
+# This runs as ROOT on a file the (unprivileged, sandboxed) app user owns, so treat
+# every path as hostile: a symlink planted in the data dir would otherwise turn a
+# read into "read any root-only file" and a write into "overwrite any file as root".
+# Refuse anything that is not a plain regular file, and never follow a link.
+if [ -L "$REQ" ] || { [ -e "$REQ" ] && [ ! -f "$REQ" ]; }; then
+  rm -f "$REQ"
+  echo "audio: ignoring a request that is not a regular file"
+  exit 0
+fi
+
 # Read and consume the request up front, so a malformed one can never loop.
 WANT="$(head -c 200 "$REQ" 2>/dev/null | tr -d '\r\n')"
 rm -f "$REQ"
@@ -630,24 +652,46 @@ esac
 OUTPUTS="$(as_app "$HELPER" --raw    2>/dev/null)"
 CURRENT="$(as_app "$HELPER" --current 2>/dev/null)"
 PINNED="$( as_app "$HELPER" --pin     2>/dev/null)"
-OUTPUTS="$OUTPUTS" CURRENT="$CURRENT" PINNED="$PINNED" python3 - <<'PY' > "$STATE".tmp
-import json, os
+# python3 does the writing so it can open the temp file O_NOFOLLOW|O_EXCL: a symlink
+# planted at that path by the app user must never become a root-owned write to
+# somewhere else. It also publishes only when there is something real to publish, so
+# a failed lookup can't blank out a good list.
+STATE="$STATE" OUTPUTS="$OUTPUTS" CURRENT="$CURRENT" PINNED="$PINNED" python3 - <<'PY'
+import json, os, sys
+
 outputs = []
 for line in os.environ.get("OUTPUTS", "").splitlines():
     line = line.strip()
     if not line:
         continue
     sink_id, _, name = line.partition(" ")
-    if sink_id.isdigit():
+    if sink_id.isdigit() and name.strip():
         outputs.append({"id": sink_id, "name": name.strip()})
-print(json.dumps({
+
+state = os.environ["STATE"]
+payload = json.dumps({
     "outputs": outputs,
     "current": os.environ.get("CURRENT", "").strip(),
     "pinned": os.environ.get("PINNED", "").strip(),
-}))
+})
+
+tmp = state + ".tmp"
+try:
+    os.unlink(tmp)
+except FileNotFoundError:
+    pass
+except OSError:
+    sys.exit(1)
+try:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+except OSError:
+    sys.exit(1)          # someone raced us for that path — publish nothing
+with os.fdopen(fd, "w") as fh:
+    fh.write(payload)
+os.replace(tmp, state)
 PY
-mv -f "$STATE".tmp "$STATE"
-chown "$APP_USER":"$APP_USER" "$STATE" 2>/dev/null || true
+# chown -h so a symlink at $STATE would be re-owned, never its target.
+chown -h "$APP_USER":"$APP_USER" "$STATE" 2>/dev/null || true
 EOF
 chmod 0755 "/usr/local/sbin/${APP}-audio"
 
@@ -690,7 +734,8 @@ set -u
 APP_USER="${APP_USER}"; APP_HOME="${APP_HOME}"; RELEASES="${RELEASES}"
 DATA_DIR="${DATA_DIR}"; WEB_PORT="${WEB_PORT}"; REPO_URL="${REPO_URL}"
 REQ="\${DATA_DIR}/update.request"; STATUS="\${DATA_DIR}/update.status"
-say(){ printf '{"state":"%s","detail":"%s","when":"%s"}\n' "\$1" "\$2" "\$(date -Is)" >"\$STATUS"; chown \${APP_USER}:\${APP_USER} "\$STATUS" 2>/dev/null || true; }
+# rm first + chown -h: root writing into the app user's dir must not follow a symlink.
+say(){ rm -f "\$STATUS" 2>/dev/null; printf '{"state":"%s","detail":"%s","when":"%s"}\n' "\$1" "\$2" "\$(date -Is)" >"\$STATUS"; chown -h \${APP_USER}:\${APP_USER} "\$STATUS" 2>/dev/null || true; }
 prep_venv(){
   sudo -u \${APP_USER} python3 -m venv --clear "\$1/.venv" >/dev/null 2>&1 || return 1
   sudo -u \${APP_USER} "\$1/.venv/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || return 1

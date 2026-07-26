@@ -63,7 +63,7 @@ def _download(url: str, dest: Path) -> None:
 
 # --- controller side --------------------------------------------------------
 
-def build_manifest(items: list, from_name: str, base_url: str) -> dict:
+def build_manifest(items: list, from_name: str, base_url: str, shuffle: bool = False) -> dict:
     """Turn the controller's library into a manifest the display can play.
     Images are referenced by a URL back to the controller so the display can
     fetch and cache them."""
@@ -95,7 +95,10 @@ def build_manifest(items: list, from_name: str, base_url: str) -> dict:
                 "type": "image", "seconds": it["seconds"],
                 "asset_url": f"{base_url}/asset/{it['ref']}",
             })
-    return {"items": out, "from": from_name}
+    # shuffle rides along with the playlist: it is part of how the controller wants
+    # this content played, not a setting of the screen showing it. An older display
+    # simply ignores the extra field.
+    return {"items": out, "from": from_name, "shuffle": bool(shuffle)}
 
 
 def push_all(displays: list, manifest: dict, site_key: str) -> list:
@@ -117,7 +120,8 @@ def items_for_display(items: list, device_id: str) -> list:
     return [it for it in items if not it.get("targets") or device_id in it["targets"]]
 
 
-def push_targeted(displays: list, items: list, from_name: str, base_url: str, site_key: str) -> list:
+def push_targeted(displays: list, items: list, from_name: str, base_url: str, site_key: str,
+                  shuffle: bool = False) -> list:
     """Per-display targeting: build each display its own manifest from the items
     aimed at it, sign it, and push. Untargeted items stack onto every display.
 
@@ -127,7 +131,7 @@ def push_targeted(displays: list, items: list, from_name: str, base_url: str, si
     def _one(d: dict) -> dict:
         name = d.get("name") or d["device_id"][:8]
         mine = items_for_display(items, d["device_id"])
-        manifest = build_manifest(mine, from_name, base_url)
+        manifest = build_manifest(mine, from_name, base_url, shuffle)
         signature = commands.sign(site_key, canon(manifest))
         url = f"http://{d['address']}:{d['port']}/api/playlist"
         try:
@@ -202,7 +206,7 @@ def receive(manifest: dict, signature: str, controller_site_key: str) -> bool:
             except Exception:
                 continue  # skip an image we couldn't fetch; keep the rest playing
             items.append({"type": "image", "src": f"/recv-asset/{name}", "seconds": it["seconds"]})
-    _save({"items": items})
+    _save({"items": items, "shuffle": bool(manifest.get("shuffle"))})
     return True
 
 
@@ -217,14 +221,28 @@ def clear_received() -> None:
     shutil.rmtree(RECV_ASSETS, ignore_errors=True)
 
 
+def _received() -> dict:
+    if not RECEIVED_PATH.exists():
+        return {}
+    try:
+        data = json.loads(RECEIVED_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def screen_items():
     """The pushed playlist for this display, or None if nothing was pushed."""
-    if not RECEIVED_PATH.exists():
+    data = _received()
+    if not data:
         return None
-    try:
-        return json.loads(RECEIVED_PATH.read_text()).get("items", [])
-    except (json.JSONDecodeError, OSError):
-        return None
+    return data.get("items", [])
+
+
+def screen_shuffle() -> bool:
+    """Whether the controller wants its pushed playlist shuffled. A playlist pushed
+    before this existed simply has no flag, and plays in order."""
+    return bool(_received().get("shuffle"))
 
 
 def recv_asset_path(name: str) -> Path:
