@@ -2015,7 +2015,9 @@ def _content_page(cfg: dict, device_id: str = "") -> HTMLResponse:
     intro = ('<p class="eyebrow">Playlist &amp; media</p><h1>Content</h1>'
              '<p class="lead">Add links and uploads, then arrange the order and '
              'timing. Changes go out to your displays automatically.</p>')
-    # Push sits with the playlist it sends. Only a controller with somewhere to send
-    # to gets the card — on a lone controller or a display it would do nothing.
+    # Push sits at the top, under the heading: it's the action you come here to take
+    # after an edit, and burying it under a long playlist meant scrolling to find it.
+    # Only a controller with somewhere to send to gets the card — on a lone controller
+    # or a display it would do nothing.
     push = _push_card() if (role == "controller" and displays) else ""
-    return _page("Content", role, cfg, intro + _content_body(cfg, targetable) + push, active="content")
+    return _page("Content", role, cfg, intro + push + _content_body(cfg, targetable), active="content")
