@@ -858,13 +858,13 @@ ok "WiFi setup helper installed (scan, host the setup network, join a chosen one
 # chosen to FAIL SAFE, because these boxes are unattended and remote-only and a
 # reboot loop nobody can power-cycle is the worst possible outcome:
 #
-#  1. A wedged init (PID 1 hung): nothing is left to restart anything. systemd's
-#     watchdog pets /dev/watchdog every RuntimeWatchdogSec/2; if init stops
-#     responding the timer expires and RESETS the box in hardware. We also load
-#     softdog so a /dev/watchdog exists even on a board without a hardware one — a
-#     software timer still catches a hung init (it can't catch a fully frozen
-#     kernel, but that is rarer). Heavy work like an update never trips it: that
-#     runs in child processes; PID 1 stays responsive. Value clamps to the hw max.
+#  1. A wedged init (PID 1 hung) OR a fully frozen kernel: nothing is left to restart
+#     anything. systemd pets the board's hardware watchdog every RuntimeWatchdogSec/2;
+#     if it stops (init hung, kernel frozen) the timer expires and RESETS the box in
+#     hardware. On a Pi that watchdog is off until enabled in the firmware config, so
+#     we enable it there. We do NOT use a software watchdog: it can't fire once the
+#     kernel is dead, and persisting it would shadow the real one. Heavy work like an
+#     update never trips it: that runs in child processes; PID 1 stays responsive.
 #
 #  2. A true kernel PANIC: default is to hang forever. kernel.panic=10 reboots
 #     after 10s instead — a transient panic then recovers on its own. We deliberately
@@ -879,14 +879,22 @@ ok "WiFi setup helper installed (scan, host the setup network, join a chosen one
 #     once the service claims to be running, so it can't fight a slow boot.
 step "Setting up self-recovery (watchdog + panic reboot + liveness)"
 
-# (1) init watchdog. Prefer the board's real hardware watchdog (a Pi's bcm2835, an
-# x86 board's iTCO, etc.) — it can reset even a fully frozen kernel. Only when NO
-# watchdog device exists do we fall back to softdog, so we never risk the software
-# timer shadowing a present hardware one (device 0 is whatever registered first).
-if [ ! -e /dev/watchdog ]; then
-  echo softdog > "/etc/modules-load.d/${APP}-watchdog.conf"
-  modprobe softdog >/dev/null 2>&1 || true
+# (1) init watchdog — the board's REAL hardware watchdog (a Pi's bcm2835, an x86
+# board's iTCO). Only hardware can reset a fully frozen kernel; a software watchdog
+# can't fire once the kernel is dead, so we do NOT use softdog — persisting it would
+# also let it shadow a hardware watchdog enabled later (it wins /dev/watchdog by load
+# order). On a Pi OS trixie image the hw watchdog is off until dtparam=watchdog=on, so
+# enable it in the firmware config (idempotent); it arms after the next reboot.
+WD_ADDED=""
+CONFIG_TXT=""
+for _c in /boot/firmware/config.txt /boot/config.txt; do [ -f "$_c" ] && { CONFIG_TXT="$_c"; break; }; done
+if [ -n "$CONFIG_TXT" ] && ! grep -qE '^[[:space:]]*dtparam=watchdog=on' "$CONFIG_TXT"; then
+  printf '\n# %s: hardware watchdog, for self-recovery from a freeze\ndtparam=watchdog=on\n' "${APP}" >> "$CONFIG_TXT"
+  WD_ADDED=1
 fi
+# Undo the softdog fallback a previous version of this installer may have left behind,
+# so it can never persist and shadow the real hardware watchdog on a future boot.
+rm -f "/etc/modules-load.d/${APP}-watchdog.conf"
 install -d -m 0755 /etc/systemd/system.conf.d
 cat > "/etc/systemd/system.conf.d/${APP}-watchdog.conf" <<'EOF'
 # Reset the machine if init itself hangs; bound a stuck reboot so it still finishes.
@@ -941,13 +949,21 @@ OnUnitActiveSec=1min
 WantedBy=timers.target
 EOF
 
-# Honest reporting: only claim the init watchdog is armed if systemd actually took it.
+# Honest reporting: distinguish armed-now, will-arm-after-reboot, and a mere software
+# watchdog (which can't catch a frozen kernel) — never overstate the protection.
 WD_US="$(systemctl show -p RuntimeWatchdogUSec --value 2>/dev/null)"
+WD_ID="$(cat /sys/class/watchdog/watchdog0/identity 2>/dev/null)"
 if [ -e /dev/watchdog ] && [ -n "$WD_US" ] && [ "$WD_US" != "0" ] && [ "$WD_US" != "off" ]; then
-  ok "self-recovery on: hung init self-resets, true panics reboot, wedged app restarts"
+  case "$WD_ID" in
+    *Software*|*software*)
+      warn "only a SOFTWARE watchdog is active (can't catch a frozen kernel).";;
+    *)
+      ok "self-recovery on: hung init self-resets, true panics reboot, wedged app restarts";;
+  esac
+elif [ -n "$WD_ADDED" ]; then
+  ok "hardware watchdog enabled in ${CONFIG_TXT} — arms after the next reboot (panic-reboot + app-liveness are on now)"
 else
-  warn "init watchdog not armed (no usable /dev/watchdog) — panic-reboot + app-liveness are still on."
-  warn "  For a hardware watchdog on a Pi: add 'dtparam=watchdog=on' to /boot/firmware/config.txt, reboot."
+  warn "no hardware watchdog on this board — panic-reboot + app-liveness are on, but a full freeze can't self-reset."
 fi
 
 # (4) don't let the power button turn the sign off. On Raspberry Pi OS Lite a single
@@ -978,6 +994,9 @@ systemctl restart "${APP}-promote.path"  >/dev/null 2>&1 || true
 systemctl restart "${APP}-update.path"   >/dev/null 2>&1 || true
 systemctl restart "${APP}-wifi.path"     >/dev/null 2>&1 || true
 systemctl restart "${APP}-audio.path"    >/dev/null 2>&1 || true
+# Start the liveness timer NOW, not just at the next boot — 'enable' alone only wires
+# it into timers.target, which already fired this boot before the installer ran.
+systemctl restart "${APP}-healthcheck.timer" >/dev/null 2>&1 || true
 
 # ---- done -------------------------------------------------------------------
 step "Done"
