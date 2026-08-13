@@ -852,8 +852,124 @@ WantedBy=multi-user.target
 EOF
 ok "WiFi setup helper installed (scan, host the setup network, join a chosen one)"
 
+# ---- self-recovery: watchdog + panic reboot + app liveness ------------------
+# A crashed service already restarts (Restart=always) and a power cut already
+# comes back (units enabled at boot). Three gaps remain, closed here — every one
+# chosen to FAIL SAFE, because these boxes are unattended and remote-only and a
+# reboot loop nobody can power-cycle is the worst possible outcome:
+#
+#  1. A wedged init (PID 1 hung): nothing is left to restart anything. systemd's
+#     watchdog pets /dev/watchdog every RuntimeWatchdogSec/2; if init stops
+#     responding the timer expires and RESETS the box in hardware. We also load
+#     softdog so a /dev/watchdog exists even on a board without a hardware one — a
+#     software timer still catches a hung init (it can't catch a fully frozen
+#     kernel, but that is rarer). Heavy work like an update never trips it: that
+#     runs in child processes; PID 1 stays responsive. Value clamps to the hw max.
+#
+#  2. A true kernel PANIC: default is to hang forever. kernel.panic=10 reboots
+#     after 10s instead — a transient panic then recovers on its own. We deliberately
+#     DO NOT set panic_on_oops: an oops is usually survivable and leaves the box
+#     REACHABLE to fix, whereas rebooting on every oops would turn one repeatable
+#     driver oops into an unrecoverable reboot loop on a device no one can reach.
+#
+#  3. An app that is ALIVE but wedged (uvicorn stops answering without exiting):
+#     Restart=always never fires (no exit) and the init watchdog never fires (PID 1
+#     is fine). A tiny timer curls /healthz and restarts ONLY the app service after
+#     it has failed several checks in a row — a restart, never a reboot, and only
+#     once the service claims to be running, so it can't fight a slow boot.
+step "Setting up self-recovery (watchdog + panic reboot + liveness)"
+
+# (1) init watchdog. Prefer the board's real hardware watchdog (a Pi's bcm2835, an
+# x86 board's iTCO, etc.) — it can reset even a fully frozen kernel. Only when NO
+# watchdog device exists do we fall back to softdog, so we never risk the software
+# timer shadowing a present hardware one (device 0 is whatever registered first).
+if [ ! -e /dev/watchdog ]; then
+  echo softdog > "/etc/modules-load.d/${APP}-watchdog.conf"
+  modprobe softdog >/dev/null 2>&1 || true
+fi
+install -d -m 0755 /etc/systemd/system.conf.d
+cat > "/etc/systemd/system.conf.d/${APP}-watchdog.conf" <<'EOF'
+# Reset the machine if init itself hangs; bound a stuck reboot so it still finishes.
+[Manager]
+RuntimeWatchdogSec=20s
+RebootWatchdogSec=2min
+EOF
+
+# (2) reboot a true panic; NOT panic_on_oops (see note above — that would loop).
+cat > "/etc/sysctl.d/90-${APP}-recovery.conf" <<'EOF'
+# Reboot 10s after a real kernel panic instead of hanging forever.
+kernel.panic = 10
+EOF
+sysctl -p "/etc/sysctl.d/90-${APP}-recovery.conf" >/dev/null 2>&1 || true
+
+# Re-exec init so the watchdog setting takes effect now, not only after a reboot.
+systemctl daemon-reexec >/dev/null 2>&1 || true
+
+# (3) app-liveness watchdog: restart the app if /healthz stops answering while the
+# service is up. Conservative on purpose — 3 misses (~3 min) before it acts.
+cat > "/usr/local/sbin/${APP}-healthcheck" <<EOF
+#!/bin/sh
+set -u
+FAILS="/run/${APP}-healthcheck.fails"
+# Only judge the app while systemd thinks it is running — never during a (slow) boot
+# or a deliberate stop, so this can't restart-loop a starting or stopped service.
+[ "\$(systemctl is-active ${APP}.service)" = "active" ] || { rm -f "\$FAILS"; exit 0; }
+if curl -sf --max-time 10 "http://localhost:${WEB_PORT}/healthz" >/dev/null 2>&1; then
+  rm -f "\$FAILS"; exit 0
+fi
+N=\$(( \$(cat "\$FAILS" 2>/dev/null || echo 0) + 1 )); echo "\$N" > "\$FAILS"
+[ "\$N" -lt 3 ] && exit 0                 # tolerate a couple of blips
+rm -f "\$FAILS"
+logger -t ${APP}-healthcheck "app unresponsive on /healthz after \$N checks — restarting ${APP}.service"
+systemctl restart ${APP}.service
+EOF
+chmod 0755 "/usr/local/sbin/${APP}-healthcheck"
+cat > "/etc/systemd/system/${APP}-healthcheck.service" <<EOF
+[Unit]
+Description=${APP} app-liveness check (restart the app if /healthz stops answering)
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/${APP}-healthcheck
+EOF
+cat > "/etc/systemd/system/${APP}-healthcheck.timer" <<EOF
+[Unit]
+Description=${APP} app-liveness check, every minute
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+[Install]
+WantedBy=timers.target
+EOF
+
+# Honest reporting: only claim the init watchdog is armed if systemd actually took it.
+WD_US="$(systemctl show -p RuntimeWatchdogUSec --value 2>/dev/null)"
+if [ -e /dev/watchdog ] && [ -n "$WD_US" ] && [ "$WD_US" != "0" ] && [ "$WD_US" != "off" ]; then
+  ok "self-recovery on: hung init self-resets, true panics reboot, wedged app restarts"
+else
+  warn "init watchdog not armed (no usable /dev/watchdog) — panic-reboot + app-liveness are still on."
+  warn "  For a hardware watchdog on a Pi: add 'dtparam=watchdog=on' to /boot/firmware/config.txt, reboot."
+fi
+
+# (4) don't let the power button turn the sign off. On Raspberry Pi OS Lite a single
+# short press of the Pi 5's power button is an IMMEDIATE shutdown, and a Pi 5 then
+# STAYS OFF until someone presses it again — a bumped button, a resting cable, or a
+# curious hand kills a wall-mounted sign for as long as nobody notices. Tell logind to
+# ignore the key so a press can't shut it down. A deliberate ~10s hold still hard-offs
+# at the PMIC (firmware, below logind), and pressing it while off still boots — so the
+# button stays useful for the operator, just not as an accidental kill switch.
+install -d -m 0755 /etc/systemd/logind.conf.d
+cat > "/etc/systemd/logind.conf.d/${APP}-powerkey.conf" <<'EOF'
+[Login]
+HandlePowerKey=ignore
+HandlePowerKeyLongPress=ignore
+EOF
+# NOT applied live: restarting systemd-logind can drop the kiosk's seat. It takes
+# effect on the next reboot, which is enough — it only needs to be armed before the
+# NEXT accidental press, not this instant.
+ok "power button set to ignore (takes effect after the next reboot; a ~10s hold still forces off)"
+
 systemctl daemon-reload
-systemctl enable "${APP}.service" "${APP}-kiosk.service" "${APP}-promote.path" "${APP}-update.path" "${APP}-wifi.path" "${APP}-audio.path" >/dev/null 2>&1 || true
+systemctl enable "${APP}.service" "${APP}-kiosk.service" "${APP}-promote.path" "${APP}-update.path" "${APP}-wifi.path" "${APP}-audio.path" "${APP}-healthcheck.timer" >/dev/null 2>&1 || true
 # Use restart (not just enable --now) so re-running the installer to UPDATE
 # actually loads the new code — enable --now is a no-op on an already-running unit.
 systemctl restart "${APP}.service"       >/dev/null 2>&1 || warn "could not start ${APP}.service yet (app code may be incomplete)"
