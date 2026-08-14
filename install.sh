@@ -420,12 +420,34 @@ else
   warn "no requirements.txt — skipping pip install"
 fi
 
-# Activate this release. An older FLAT install (a real dir, not a symlink) is
-# retired into ${RELEASES} first so it remains as a rollback target.
-if [ -e "$APP_HOME" ] && [ ! -L "$APP_HOME" ]; then
-  rm -rf "${RELEASES}/rel-preexisting"
-  mv "$APP_HOME" "${RELEASES}/rel-preexisting" 2>/dev/null || rm -rf "$APP_HOME"
+# Smoke-test the new build BEFORE activating it. Importing app.server pulls in every
+# dependency (FastAPI, Starlette, pydantic, ...) without starting a server or binding a
+# port, so a broken/mismatched install fails HERE — while the currently-running release
+# is still untouched — instead of after activation as a crash loop. This is exactly the
+# failure that once stranded a device: a flaky-network update resolved a bad
+# FastAPI/Starlette pair and 'import app.server' would have caught it.
+if [ -f "$REL/requirements.txt" ]; then
+  if ! import_err="$(cd "$REL" && sudo -u "$APP_USER" "$REL/.venv/bin/python" -c 'import app.server' 2>&1)"; then
+    warn "new build failed its import check — keeping the current version, discarding this one:"
+    printf '%s\n' "$import_err" | tail -4 | sed 's/^/    /'
+    rm -rf "$REL"
+    die "update aborted before activation; the device is still on its working version."
+  fi
+  ok "new build imports cleanly"
 fi
+
+# Activate this release, remembering what was active so an unhealthy new release can be
+# rolled back after restart. An older FLAT install (a real dir, not a symlink) is
+# retired into ${RELEASES} first so it remains as a rollback target.
+if [ -L "$APP_HOME" ]; then
+  PREV_REL="$(readlink -f "$APP_HOME" 2>/dev/null || true)"
+elif [ -e "$APP_HOME" ]; then
+  rm -rf "${RELEASES}/rel-preexisting"
+  if mv "$APP_HOME" "${RELEASES}/rel-preexisting" 2>/dev/null; then PREV_REL="${RELEASES}/rel-preexisting"; else rm -rf "$APP_HOME"; PREV_REL=""; fi
+else
+  PREV_REL=""
+fi
+[ "$PREV_REL" = "$REL" ] && PREV_REL=""     # never "roll back" to the release we're installing
 ln -sfn "$REL" "$APP_HOME"          # atomic activate
 chown -h "$APP_USER":"$APP_USER" "$APP_HOME" 2>/dev/null || true
 ok "activated ${APP_HOME} -> ${REL}"
@@ -997,6 +1019,35 @@ systemctl restart "${APP}-audio.path"    >/dev/null 2>&1 || true
 # Start the liveness timer NOW, not just at the next boot — 'enable' alone only wires
 # it into timers.target, which already fired this boot before the installer ran.
 systemctl restart "${APP}-healthcheck.timer" >/dev/null 2>&1 || true
+
+# ---- verify the new release actually serves; roll back if it doesn't --------
+# The import check above catches a broken build before activation. This second gate
+# catches a build that imports but won't come up (a startup crash, a bad config, a
+# port it can't bind): wait for /healthz, and if it never answers, relink to the
+# release that was active before this run and restart. A remote, unattended device
+# must never be left crash-looping — same safety the in-app updater already has.
+if [ "$CHECK_ONLY" != 1 ]; then
+  step "Verifying the new version is healthy"
+  _healthy=0
+  for _i in $(seq 1 45); do
+    curl -sf "http://localhost:${WEB_PORT}/healthz" >/dev/null 2>&1 && { _healthy=1; break; }
+    sleep 1
+  done
+  if [ "$_healthy" = 1 ]; then
+    ok "new version is up and answering /healthz"
+  elif [ -n "${PREV_REL:-}" ] && [ -d "$PREV_REL" ]; then
+    warn "the new version did not answer /healthz — rolling back to the previous release"
+    ln -sfn "$PREV_REL" "$APP_HOME"; chown -h "$APP_USER":"$APP_USER" "$APP_HOME" 2>/dev/null || true
+    systemctl restart "${APP}.service" >/dev/null 2>&1 || true
+    for _i in $(seq 1 30); do curl -sf "http://localhost:${WEB_PORT}/healthz" >/dev/null 2>&1 && break; sleep 1; done
+    systemctl restart "${APP}-kiosk.service" >/dev/null 2>&1 || true
+    rm -rf "$REL"
+    die "update did not start; rolled back to ${PREV_REL}. The device is on its previous, working version."
+  else
+    warn "the new version did not answer /healthz, and there is no previous release to roll back to."
+    warn "  Check what failed:  sudo journalctl -u ${APP}.service -n 40 --no-pager"
+  fi
+fi
 
 # ---- done -------------------------------------------------------------------
 step "Done"

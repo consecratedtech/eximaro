@@ -1,18 +1,37 @@
-# Core web service
-fastapi>=0.115
-uvicorn[standard]>=0.30
-jinja2>=3.1
-python-multipart>=0.0.9
+# Pinned to the EXACT versions verified working on a device (2026-08-14).
+#
+# These were ranges ('fastapi>=0.115', etc.). An update over a flaky network then
+# resolved an incompatible FastAPI/Starlette pair, and the app died on every start
+# with "cannot import name 'BackgroundTasks' from 'fastapi'" — a crash loop that
+# stranded the device. Pinning makes every build reproducible: the same known-good
+# set installs whether the update runs today or a year from now, on any device.
+# To bump: upgrade in a venv, run the tests, confirm on a real device, then re-pin.
 
-# Security: password hashing + encrypted-at-rest secrets
-argon2-cffi>=23.1
-cryptography>=43.0
+# --- core web service ---
+fastapi==0.140.0
+starlette==1.3.1            # FastAPI re-exports BackgroundTasks from here; must match FastAPI
+uvicorn[standard]==0.51.0
+jinja2==3.1.6
+python-multipart==0.0.32
 
-# LAN discovery (mDNS)
-zeroconf>=0.131
+# --- FastAPI's data layer (kept in lockstep so they can't drift apart) ---
+pydantic==2.13.4
+pydantic-core==2.46.4
+anyio==4.14.2
+typing-extensions==4.16.0
+h11==0.16.0
+click==8.4.2
 
-# Content handling (images, conversions)
-pillow>=10.4
+# --- security: password hashing + encrypted-at-rest secrets ---
+argon2-cffi==25.1.0
+argon2-cffi-bindings==25.1.0
+cryptography==49.0.0
 
-# QR code for the on-screen "scan to open" setup helper
-qrcode>=7.4
+# --- LAN discovery (mDNS) ---
+zeroconf==0.150.0
+
+# --- content handling (images, conversions) ---
+pillow==12.3.0
+
+# --- QR code for the on-screen "scan to open" setup helper ---
+qrcode==8.2
