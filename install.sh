@@ -986,33 +986,28 @@ step "Setting up self-recovery (watchdog + panic reboot + liveness)"
 # also let it shadow a hardware watchdog enabled later (it wins /dev/watchdog by load
 # order). On a Pi OS trixie image the hw watchdog is off until dtparam=watchdog=on, so
 # enable it in the firmware config (idempotent); it arms after the next reboot.
-WD_ADDED=""
-CONFIG_TXT=""
-for _c in /boot/firmware/config.txt /boot/config.txt; do [ -f "$_c" ] && { CONFIG_TXT="$_c"; break; }; done
-if [ -n "$CONFIG_TXT" ] && ! grep -qE '^[[:space:]]*dtparam=watchdog=on' "$CONFIG_TXT"; then
-  printf '\n# %s: hardware watchdog, for self-recovery from a freeze\ndtparam=watchdog=on\n' "${APP}" >> "$CONFIG_TXT"
-  WD_ADDED=1
-fi
-# Undo the softdog fallback a previous version of this installer may have left behind,
-# so it can never persist and shadow the real hardware watchdog on a future boot.
-rm -f "/etc/modules-load.d/${APP}-watchdog.conf"
-install -d -m 0755 /etc/systemd/system.conf.d
-cat > "/etc/systemd/system.conf.d/${APP}-watchdog.conf" <<'EOF'
-# Reset the machine if init itself hangs; bound a stuck reboot so it still finishes.
-[Manager]
-RuntimeWatchdogSec=20s
-RebootWatchdogSec=2min
-EOF
-
-# (2) reboot a true panic; NOT panic_on_oops (see note above — that would loop).
-cat > "/etc/sysctl.d/90-${APP}-recovery.conf" <<'EOF'
-# Reboot 10s after a real kernel panic instead of hanging forever.
-kernel.panic = 10
-EOF
-sysctl -p "/etc/sysctl.d/90-${APP}-recovery.conf" >/dev/null 2>&1 || true
-
-# Re-exec init so the watchdog setting takes effect now, not only after a reboot.
+# (1) NO hardware watchdog. An earlier version of this installer armed systemd's
+# watchdog (RuntimeWatchdogSec) and enabled dtparam=watchdog=on. On a real Pi 5 that
+# REBOOTED THE DEVICE ROUGHLY EVERY 20 SECONDS — the exact unattended-brick this was
+# meant to prevent. A watchdog that resets a healthy machine is far worse than the
+# rare freeze it guards against, and this appliance already recovers from every
+# failure that actually happens in the field: services restart on crash, units start
+# at boot after a power cut, and the liveness timer below restarts a wedged app.
+# Do not re-introduce a watchdog without proving it on hardware over hours, not
+# minutes. Actively REMOVE it from any device a previous version armed:
+rm -f "/etc/systemd/system.conf.d/${APP}-watchdog.conf" \
+      "/etc/modules-load.d/${APP}-watchdog.conf" \
+      "/etc/sysctl.d/90-${APP}-recovery.conf"
+for _c in /boot/firmware/config.txt /boot/config.txt; do
+  if [ -f "$_c" ] && grep -qE "^[[:space:]]*dtparam=watchdog=on" "$_c"; then
+    sed -i "/^# ${APP}: hardware watchdog/d; /^[[:space:]]*dtparam=watchdog=on[[:space:]]*$/d" "$_c"
+    warn "removed the hardware-watchdog line this installer previously added to $_c"
+  fi
+done
+sysctl -w kernel.panic=0 >/dev/null 2>&1 || true
+# Re-exec init so a previously-armed watchdog is disarmed NOW, not at the next boot.
 systemctl daemon-reexec >/dev/null 2>&1 || true
+ok "no watchdog (a previous version's watchdog is removed if present)"
 
 # (3) app-liveness watchdog: restart the app if /healthz stops answering while the
 # service is up. Conservative on purpose — 3 misses (~3 min) before it acts.
@@ -1050,22 +1045,7 @@ OnUnitActiveSec=1min
 WantedBy=timers.target
 EOF
 
-# Honest reporting: distinguish armed-now, will-arm-after-reboot, and a mere software
-# watchdog (which can't catch a frozen kernel) — never overstate the protection.
-WD_US="$(systemctl show -p RuntimeWatchdogUSec --value 2>/dev/null)"
-WD_ID="$(cat /sys/class/watchdog/watchdog0/identity 2>/dev/null)"
-if [ -e /dev/watchdog ] && [ -n "$WD_US" ] && [ "$WD_US" != "0" ] && [ "$WD_US" != "off" ]; then
-  case "$WD_ID" in
-    *Software*|*software*)
-      warn "only a SOFTWARE watchdog is active (can't catch a frozen kernel).";;
-    *)
-      ok "self-recovery on: hung init self-resets, true panics reboot, wedged app restarts";;
-  esac
-elif [ -n "$WD_ADDED" ]; then
-  ok "hardware watchdog enabled in ${CONFIG_TXT} — arms after the next reboot (panic-reboot + app-liveness are on now)"
-else
-  warn "no hardware watchdog on this board — panic-reboot + app-liveness are on, but a full freeze can't self-reset."
-fi
+ok "self-recovery: services restart on crash, start at boot, and a wedged app restarts"
 
 # (4) don't let the power button turn the sign off. On Raspberry Pi OS Lite a single
 # short press of the Pi 5's power button is an IMMEDIATE shutdown, and a Pi 5 then
