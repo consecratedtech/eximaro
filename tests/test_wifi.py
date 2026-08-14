@@ -62,21 +62,54 @@ def test_join_qr_payload_matches_creds(clean_data_dir):
 
 
 # --- watcher decision (pure state machine) ----------------------------------
+# Signature: _decide(real, ap, configured, manual, down_since, now)
 
 def test_decide_online_no_ap_is_noop():
-    assert wifi._decide(True, False, None, 100) == (None, None)
+    assert wifi._decide(True, False, False, False, None, 100) == (None, None)
 
 
 def test_decide_online_with_ap_stops_setup():
-    assert wifi._decide(True, True, 50, 100) == ("stop", None)
+    assert wifi._decide(True, True, False, False, 50, 100) == ("stop", None)
 
 
-def test_decide_offline_already_hosting_stays():
-    assert wifi._decide(False, True, None, 100) == (None, None)
+def test_decide_unconfigured_offline_already_hosting_stays():
+    assert wifi._decide(False, True, False, False, None, 100) == (None, None)
 
 
-def test_decide_offline_waits_grace_then_hosts():
-    action, ds = wifi._decide(False, False, None, 100)
-    assert action is None and ds == 100                                    # outage starts counting
-    assert wifi._decide(False, False, 100, 100 + wifi.SETUP_GRACE - 1)[0] is None    # within grace
-    assert wifi._decide(False, False, 100, 100 + wifi.SETUP_GRACE)[0] == "hotspot"   # grace elapsed
+def test_decide_unconfigured_offline_waits_grace_then_hosts():
+    action, ds = wifi._decide(False, False, False, False, None, 100)
+    assert action is None and ds == 100                                                  # outage starts counting
+    assert wifi._decide(False, False, False, False, 100, 100 + wifi.SETUP_GRACE - 1)[0] is None      # within grace
+    assert wifi._decide(False, False, False, False, 100, 100 + wifi.SETUP_GRACE)[0] == "hotspot"     # grace elapsed
+
+
+# --- the bug: a CONFIGURED device must reconnect, never seize the radio ------
+
+def test_decide_configured_offline_never_hosts_the_setup_ap():
+    # Booted before the router / rode out an outage: keep the radio free for the
+    # reconnect. Even long past the grace, it must NOT host the setup AP.
+    assert wifi._decide(False, False, True, False, 100, 100 + 10_000) == (None, None)
+
+
+def test_decide_configured_offline_drops_a_stale_setup_ap():
+    # If a setup AP is somehow up on a configured device, tear it down so
+    # NetworkManager can reclaim the radio and rejoin the saved network.
+    assert wifi._decide(False, True, True, False, None, 100) == ("stop", None)
+
+
+def test_decide_manual_setup_leaves_the_ap_alone_even_when_configured():
+    # Operator is reconfiguring by hand — don't fight their setup AP.
+    assert wifi._decide(False, True, True, True, None, 100) == (None, None)
+
+
+def test_decide_online_always_wins_over_manual():
+    # A real connection is the goal; drop the AP regardless of the manual flag.
+    assert wifi._decide(True, True, True, True, 50, 100) == ("stop", None)
+
+
+def test_provisioned_flag_roundtrip(clean_data_dir):
+    assert not wifi.is_provisioned()
+    wifi._mark_provisioned()
+    assert wifi.is_provisioned()
+    wifi._mark_provisioned()   # idempotent
+    assert wifi.is_provisioned()

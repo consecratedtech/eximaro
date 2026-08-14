@@ -550,7 +550,9 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
 
     @app.post("/api/wifi/start")
     def wifi_start():
-        wifi.request_hotspot()
+        # Explicit operator action: host the setup AP AND tell the watcher to leave it
+        # up, so it isn't torn straight back down on a device that has a saved network.
+        wifi.start_manual_setup()
         activity.log("Started the WiFi setup network")
         return RedirectResponse("/wifi-setup", status_code=303)
 

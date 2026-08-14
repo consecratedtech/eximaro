@@ -144,10 +144,24 @@ def do_scan(req=None) -> None:
     _write(SCAN, {"networks": nets, "when": _now()})
 
 
+def _has_saved_wifi() -> bool:
+    """Is there a real Wi-Fi network already configured to reconnect to (any saved
+    wireless profile that isn't our own setup Hotspot)? When there is, the device must
+    keep trying to rejoin it rather than seize the radio for the setup network."""
+    res = _nmcli("-t", "-f", "NAME,TYPE", "connection", "show", timeout=15)
+    for line in res.stdout.splitlines():
+        p = _split_terse(line)
+        if len(p) >= 2 and p[1] == "802-11-wireless" and p[0] != "Hotspot":
+            return True
+    return False
+
+
 def do_status(req=None) -> None:
     """What the Wi-Fi radio is doing right now: connected/disconnected, to which
-    network, and whether we're currently hosting the setup network."""
-    st = {"wifi": None, "ssid": None, "ap_active": False, "when": _now()}
+    network, whether we're hosting the setup network, and whether a real network is
+    already saved (so the watcher knows to reconnect instead of offering setup)."""
+    st = {"wifi": None, "ssid": None, "ap_active": False,
+          "has_saved": _has_saved_wifi(), "when": _now()}
     res = _nmcli("-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status")
     for line in res.stdout.splitlines():
         p = _split_terse(line)
@@ -208,6 +222,10 @@ def do_connect(req) -> None:
     r = _nmcli(*args, timeout=45)
     if r.returncode == 0:
         _nmcli("connection", "delete", "Hotspot", timeout=10)  # don't let the AP come back
+        # Retry forever on reconnect: the default gives up after a few tries, which is
+        # exactly how a sign that booted before its router ends up stranded offline.
+        _nmcli("connection", "modify", ssid, "connection.autoconnect", "yes",
+               "connection.autoconnect-retries", "0", timeout=10)
         _captive_off()   # clean client mode — no redirect left behind
         do_status(req)
     else:

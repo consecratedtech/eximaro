@@ -128,27 +128,68 @@ def pending() -> bool:
 
 
 # --- autonomous setup mode --------------------------------------------------
-# A background watcher drives the whole flow: when nothing works for a while it
-# hosts the setup network (so the screen shows the join QR); once a real connection
-# comes up it takes the setup network back down; if the connection later drops, it
-# goes back to setup. Only the host/stop actions go through the helper — the
-# detection is app-side.
+# A background watcher drives the flow: a device that has NEVER been configured hosts
+# the setup network when offline (so the screen shows the join QR); a device that
+# already has a network must instead keep RECONNECTING to it — hosting the setup AP
+# would seize the one radio and block the reconnect, stranding a sign that merely
+# booted before its router or rode out a brief outage. Detection is app-side; only
+# host/stop go through the helper.
 
-SETUP_GRACE = 15  # seconds with no real connection before hosting the setup network
+SETUP_GRACE = 45  # seconds offline before an UNCONFIGURED device offers setup
+
+PROVISIONED_PATH = config.DATA / "wifi-provisioned"  # set once the device is ever online
+MANUAL_SETUP_WINDOW = 600  # seconds a hand-started setup AP is left alone by the watcher
+
+_manual_setup_until = 0.0  # monotonic deadline; module-level, shared with the watcher thread
 
 
-def _decide(real, ap, down_since, now, grace=SETUP_GRACE):
-    """Pure decision for the watcher, split out so it can be tested without touching
-    the network. Returns (action, down_since') where action is None, 'hotspot'
-    (start setup), or 'stop' (a real connection came up, drop setup). The grace
-    delay lets a briefly-dropped WiFi reconnect on its own before we seize the radio
-    for the setup network."""
+def _mark_provisioned() -> None:
+    """Remember that this device has had a working network — from then on an outage
+    means 'reconnect', not 'offer setup'."""
+    try:
+        config.DATA.mkdir(parents=True, exist_ok=True)
+        if not PROVISIONED_PATH.exists():
+            PROVISIONED_PATH.write_text("1")
+    except OSError:
+        pass
+
+
+def is_provisioned() -> bool:
+    return PROVISIONED_PATH.exists()
+
+
+def start_manual_setup() -> None:
+    """Operator explicitly asked to (re)configure WiFi from the panel. Host the setup
+    AP and tell the watcher to leave it up for a while — otherwise, on a device that
+    already has a saved network, the watcher would immediately tear it back down."""
+    global _manual_setup_until
+    _manual_setup_until = time.monotonic() + MANUAL_SETUP_WINDOW
+    request_hotspot()
+
+
+def _decide(real, ap, configured, manual, down_since, now, grace=SETUP_GRACE):
+    """Pure decision for the watcher (split out so it can be tested without a radio).
+    Returns (action, down_since') where action is None, 'hotspot' (start setup), or
+    'stop' (drop the setup AP).
+
+      real       - a genuine, non-setup connection is up right now
+      configured - a network is already saved / the device has been online before
+      manual     - the operator is running setup by hand right now (leave the AP alone)
+    """
     if real:
+        return ("stop" if ap else None), None      # online: drop any setup AP
+    if manual:
+        return None, None                          # hand-run setup: don't touch it
+    if configured:
+        # A network is saved. Never seize the radio for a setup AP — that blocks the
+        # reconnect and deadlocks. Free the radio (drop a stale AP) and let
+        # NetworkManager keep retrying the saved network until it comes back.
         return ("stop" if ap else None), None
+    # Never configured and offline: this is genuine first-time setup.
     if ap:
-        return None, None                     # already hosting setup; leave it up
+        return None, None                          # already hosting; leave it up
     if down_since is None:
-        return None, now                      # start counting the outage
+        return None, now                           # start counting the outage
     if now - down_since >= grace:
         return "hotspot", down_since
     return None, down_since
@@ -156,11 +197,23 @@ def _decide(real, ap, down_since, now, grace=SETUP_GRACE):
 
 def _watch_loop():
     down_since = None
+    ticks = 0
+    request_status()   # learn straight away whether a network is already saved
     while True:
-        time.sleep(5)   # check often so a dropped connection flips to setup quickly
+        time.sleep(5)
+        ticks += 1
         try:
+            real = bool(discovery.real_ips())
+            if real:
+                _mark_provisioned()
+            # Keep the saved-network signal fresh, especially while offline, so a boot
+            # before the router doesn't misread it as an unconfigured device.
+            if not real and ticks % 6 == 1:        # ~every 30s while offline
+                request_status()
+            configured = is_provisioned() or bool(status().get("has_saved"))
             action, down_since = _decide(
-                bool(discovery.real_ips()), discovery.hosting_ap(),
+                real, discovery.hosting_ap(), configured,
+                time.monotonic() < _manual_setup_until,
                 down_since, time.monotonic())
             if action == "stop":
                 request_stop()
