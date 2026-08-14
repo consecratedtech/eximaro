@@ -420,6 +420,9 @@ def create_app() -> FastAPI:
             "items": items,
             "pairing_code": pairing.current_code(),
             "shuffle": shuffle,
+            # Shown ONLY on the boot splash (never over playing content): a failed
+            # update should be visible to whoever walks past a rebooted screen.
+            "update_alert": updater.alert(),
             # Where to reach this device: every interface, labeled, Wi-Fi first, so a
             # wired + Wi-Fi box shows both and you use whichever network you're on.
             # connect_url (and the QR) is the first one; null means no network yet.
@@ -715,6 +718,13 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
     def refresh_audio():
         # Re-scan the hardware (e.g. a soundbar was just plugged in).
         audio.refresh()
+        return RedirectResponse("/", status_code=303)
+
+    @app.post("/api/update/ack")
+    def update_ack():
+        # Operator has seen the failed-update banner; stop showing it.
+        updater.acknowledge()
+        activity.log("Dismissed an update-failure notice")
         return RedirectResponse("/", status_code=303)
 
     @app.get("/api/update-status")
@@ -1482,6 +1492,26 @@ _WORKING_HTML = """
   </script>"""
 
 
+def _update_alert_banner() -> str:
+    """A persistent, dismissable banner when the last update failed or rolled back.
+    On every panel page — a failed update on an unattended device must never be
+    silent. It survives reboots (the status lives on disk) until a later update
+    succeeds or the operator dismisses it."""
+    msg = updater.alert()
+    if not msg:
+        return ""
+    return f"""
+      <div class="card note warn" style="display:flex;gap:12px;align-items:flex-start;justify-content:space-between">
+        <div>
+          <h2 style="margin-top:0">Update problem</h2>
+          <p class="hint">{_esc(msg)}</p>
+        </div>
+        <form method="post" action="/api/update/ack" style="margin:0">
+          <button class="btn-ghost" type="submit">Dismiss</button>
+        </form>
+      </div>"""
+
+
 def _page(title: str, role: str, cfg: dict, body: str, active: str = "home") -> HTMLResponse:
     html = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -1494,6 +1524,7 @@ def _page(title: str, role: str, cfg: dict, body: str, active: str = "home") -> 
   <main class="stage">
     {_header(cfg, role)}
     {_nav(active, role)}
+    {_update_alert_banner()}
     {body}
   </main>
   {_settings_drawer(cfg, role)}

@@ -45,6 +45,11 @@ trap 'rm -rf "$TMP"' EXIT
 if ! git clone --depth 1 "$REPO_URL" "$TMP/eximaro"; then
   echo "Couldn't download the update. Either this device is offline, or the"
   echo "repository is private and this device has no access to it yet."
+  # Leave the outcome where the running app can show it (panel banner + boot screen),
+  # so a failed update on an unattended device is never silent.
+  printf '{"state":"failed","detail":"The last update could not be downloaded (no internet, or no access to the repository). This device is still on its previous version.","when":"%s"}\n' "$(date -Is)" \
+    > "${DATA_DIR}/update.status" 2>/dev/null || true
+  chown -h "$(stat -c '%U' "$DATA_DIR" 2>/dev/null || echo root)" "${DATA_DIR}/update.status" 2>/dev/null || true
   exit 1
 fi
 

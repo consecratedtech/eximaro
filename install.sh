@@ -38,6 +38,19 @@ warn() { echo "$(c '0;33' 'warn ') $*"; }
 die()  { echo "$(c '0;31' 'FAIL ') $*" >&2; exit 1; }
 step() { echo; echo "$(c '1;36' "==> $*")"; }
 
+# Record the update outcome where the RUNNING app can see it, so a failed/rolled-back
+# update is never silent — the panel shows a banner and the screen shows a notice.
+# Same file + format the in-app updater writes. detail is sanitised so an error
+# message can't produce broken JSON.
+update_status() {
+  _us_detail="$(printf '%s' "${2:-}" | tr -d '\r\n' | tr '"\\' "' " | cut -c1-200)"
+  install -d -m 0755 "$DATA_DIR" 2>/dev/null || true
+  rm -f "$DATA_DIR/update.status" 2>/dev/null || true
+  printf '{"state":"%s","detail":"%s","when":"%s"}\n' "$1" "$_us_detail" "$(date -Is)" \
+    > "$DATA_DIR/update.status" 2>/dev/null || true
+  chown -h "$APP_USER":"$APP_USER" "$DATA_DIR/update.status" 2>/dev/null || true
+}
+
 # ---- args -------------------------------------------------------------------
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -430,6 +443,7 @@ if [ -f "$REL/requirements.txt" ]; then
   if ! import_err="$(cd "$REL" && sudo -u "$APP_USER" "$REL/.venv/bin/python" -c 'import app.server' 2>&1)"; then
     warn "new build failed its import check — keeping the current version, discarding this one:"
     printf '%s\n' "$import_err" | tail -4 | sed 's/^/    /'
+    update_status failed "The last update could not start (a dependency problem) and was not applied — this device is still on its previous, working version."
     rm -rf "$REL"
     die "update aborted before activation; the device is still on its working version."
   fi
@@ -1035,16 +1049,19 @@ if [ "$CHECK_ONLY" != 1 ]; then
   done
   if [ "$_healthy" = 1 ]; then
     ok "new version is up and answering /healthz"
+    [ -n "${PREV_REL:-}" ] && update_status done "Updated successfully."
   elif [ -n "${PREV_REL:-}" ] && [ -d "$PREV_REL" ]; then
     warn "the new version did not answer /healthz — rolling back to the previous release"
     ln -sfn "$PREV_REL" "$APP_HOME"; chown -h "$APP_USER":"$APP_USER" "$APP_HOME" 2>/dev/null || true
     systemctl restart "${APP}.service" >/dev/null 2>&1 || true
     for _i in $(seq 1 30); do curl -sf "http://localhost:${WEB_PORT}/healthz" >/dev/null 2>&1 && break; sleep 1; done
     systemctl restart "${APP}-kiosk.service" >/dev/null 2>&1 || true
+    update_status rolled_back "The last update failed to start and was rolled back — this device is on its previous, working version. Try again on a stronger connection."
     rm -rf "$REL"
     die "update did not start; rolled back to ${PREV_REL}. The device is on its previous, working version."
   else
     warn "the new version did not answer /healthz, and there is no previous release to roll back to."
+    update_status failed "The last update did not start and there was no previous version to fall back to. This device needs attention."
     warn "  Check what failed:  sudo journalctl -u ${APP}.service -n 40 --no-pager"
   fi
 fi
