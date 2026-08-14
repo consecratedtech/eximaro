@@ -467,10 +467,41 @@ ok "release staged at ${REL}"
 
 step "Setting up Python environment (venv — required on trixie/PEP 668)"
 sudo -u "$APP_USER" python3 -m venv --clear "$REL/.venv"
-sudo -u "$APP_USER" "$REL/.venv/bin/pip" install --quiet --upgrade pip
+# --no-cache-dir throughout: a download interrupted by a weak network can leave a
+# TRUNCATED wheel in pip's cache, and pip will happily reuse it on every later build —
+# installing a package that looks present but is incomplete (import fails at runtime).
+# That cost a device its app twice in one evening; rebuilding with --no-cache-dir was
+# what fixed it. Re-downloading a few MB is a trivial price for a build that is right.
+sudo -u "$APP_USER" "$REL/.venv/bin/pip" install --quiet --no-cache-dir --upgrade pip
 if [ -f "$REL/requirements.txt" ]; then
-  sudo -u "$APP_USER" "$REL/.venv/bin/pip" install --quiet -r "$REL/requirements.txt"
-  ok "python dependencies installed in venv"
+  if ! pip_err="$(sudo -u "$APP_USER" "$REL/.venv/bin/pip" install --no-cache-dir \
+                    -r "$REL/requirements.txt" 2>&1)"; then
+    printf '%s\n' "$pip_err" | tail -6 | sed 's/^/    /'
+    update_status failed "The last update could not download its components (weak connection) and was not applied — this device is still on its previous, working version."
+    rm -rf "$REL"
+    die "could not install the Python dependencies; nothing on this device was changed."
+  fi
+  # Trust nothing: confirm every pinned package is actually IMPORTABLE, not merely
+  # present on disk. pip has exited 0 with an incomplete install before.
+  if ! dep_err="$(sudo -u "$APP_USER" "$REL/.venv/bin/python" - <<'PY' 2>&1
+import importlib, sys
+missing = []
+for mod in ("fastapi", "starlette", "uvicorn", "pydantic", "jinja2",
+            "multipart", "argon2", "cryptography", "zeroconf", "PIL", "qrcode"):
+    try:
+        importlib.import_module(mod)
+    except Exception as exc:            # noqa: BLE001 - report anything that fails
+        missing.append(f"{mod}: {exc}")
+if missing:
+    print("\n".join(missing)); sys.exit(1)
+PY
+  )"; then
+    printf '%s\n' "$dep_err" | tail -6 | sed 's/^/    /'
+    update_status failed "The last update installed damaged components and was not applied — this device is still on its previous, working version. Try again on a stronger connection."
+    rm -rf "$REL"
+    die "the installed dependencies are incomplete; nothing on this device was changed."
+  fi
+  ok "python dependencies installed and verified"
 else
   warn "no requirements.txt — skipping pip install"
 fi
@@ -826,10 +857,12 @@ DATA_DIR="${DATA_DIR}"; WEB_PORT="${WEB_PORT}"; REPO_URL="${REPO_URL}"
 REQ="\${DATA_DIR}/update.request"; STATUS="\${DATA_DIR}/update.status"
 # rm first + chown -h: root writing into the app user's dir must not follow a symlink.
 say(){ rm -f "\$STATUS" 2>/dev/null; printf '{"state":"%s","detail":"%s","when":"%s"}\n' "\$1" "\$2" "\$(date -Is)" >"\$STATUS"; chown -h \${APP_USER}:\${APP_USER} "\$STATUS" 2>/dev/null || true; }
+# --no-cache-dir: a wheel truncated by a weak connection stays in pip's cache and gets
+# reused on every later build, installing a package that looks present but is broken.
 prep_venv(){
   sudo -u \${APP_USER} python3 -m venv --clear "\$1/.venv" >/dev/null 2>&1 || return 1
-  sudo -u \${APP_USER} "\$1/.venv/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || return 1
-  sudo -u \${APP_USER} "\$1/.venv/bin/pip" install --quiet -r "\$1/requirements.txt" >/dev/null 2>&1 || return 1
+  sudo -u \${APP_USER} "\$1/.venv/bin/pip" install --quiet --no-cache-dir --upgrade pip >/dev/null 2>&1 || return 1
+  sudo -u \${APP_USER} "\$1/.venv/bin/pip" install --quiet --no-cache-dir -r "\$1/requirements.txt" >/dev/null 2>&1 || return 1
 }
 SRC_REQ="\$(head -c 300 "\$REQ" 2>/dev/null | tr -d '\r\n')"; rm -f "\$REQ"
 PREV="\$(readlink -f "\$APP_HOME" 2>/dev/null)"
