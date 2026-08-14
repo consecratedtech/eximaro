@@ -44,7 +44,10 @@ step() { echo; echo "$(c '1;36' "==> $*")"; }
 # message can't produce broken JSON.
 update_status() {
   _us_detail="$(printf '%s' "${2:-}" | tr -d '\r\n' | tr '"\\' "' " | cut -c1-200)"
-  install -d -m 0755 "$DATA_DIR" 2>/dev/null || true
+  # Never create or re-mode the data dir here: it is 0700 and holds the secrets
+  # (master key, vault). Creating it 0755 would silently widen those permissions on
+  # every update. If it doesn't exist yet there is no app to show the status anyway.
+  [ -d "$DATA_DIR" ] || return 0
   rm -f "$DATA_DIR/update.status" 2>/dev/null || true
   printf '{"state":"%s","detail":"%s","when":"%s"}\n' "$1" "$_us_detail" "$(date -Is)" \
     > "$DATA_DIR/update.status" 2>/dev/null || true
@@ -440,7 +443,16 @@ fi
 # failure that once stranded a device: a flaky-network update resolved a bad
 # FastAPI/Starlette pair and 'import app.server' would have caught it.
 if [ -f "$REL/requirements.txt" ]; then
-  if ! import_err="$(cd "$REL" && sudo -u "$APP_USER" "$REL/.venv/bin/python" -c 'import app.server' 2>&1)"; then
+  # Exercise what actually RUNS, not just one module: uvicorn (imported by app.__main__,
+  # not by app.server), plus building the real app object — that registers every route,
+  # mounts the static files and constructs FastAPI, so a broken resolve anywhere in the
+  # web stack fails HERE rather than after activation. Only the server socket is left
+  # unbound, which the /healthz gate below covers.
+  if ! import_err="$(cd "$REL" && sudo -u "$APP_USER" "$REL/.venv/bin/python" -c '
+import app.__main__, uvicorn
+from app.server import create_app
+create_app()
+' 2>&1)"; then
     warn "new build failed its import check — keeping the current version, discarding this one:"
     printf '%s\n' "$import_err" | tail -4 | sed 's/^/    /'
     update_status failed "The last update could not start (a dependency problem) and was not applied — this device is still on its previous, working version."
@@ -465,8 +477,11 @@ fi
 ln -sfn "$REL" "$APP_HOME"          # atomic activate
 chown -h "$APP_USER":"$APP_USER" "$APP_HOME" 2>/dev/null || true
 ok "activated ${APP_HOME} -> ${REL}"
-# Keep the newest few releases for rollback; prune older ones.
-ls -1dt "${RELEASES}"/rel-* 2>/dev/null | tail -n +4 | xargs -r rm -rf || true
+# Pruning old releases is deliberately DEFERRED until the health gate at the end has
+# proven this release serves. Pruning here would run before we know the new build
+# works, and picks survivors by mtime — so on a device whose clock jumped (no RTC on a
+# Pi; fake-hwclock + a late NTP sync), the rollback target could rank old and be
+# deleted, leaving nothing to roll back to. See the prune after the health check.
 
 # ---- systemd: the app service ----------------------------------------------
 step "Installing services"
@@ -791,10 +806,21 @@ REL="\${RELEASES}/rel-\$(date +%s)"; rm -rf "\$REL"; mkdir -p "\$REL"
 cp -a "\$SRC/." "\$REL/"; rm -rf "\$REL/.venv" "\$REL/.git"; chown -R \${APP_USER}:\${APP_USER} "\$REL"
 say running "installing dependencies"
 if ! prep_venv "\$REL"; then say failed "could not prepare the new version; staying on the current one"; rm -rf "\$REL"; exit 0; fi
+# Same pre-activation gate the installer uses: build the real app object in the new
+# venv BEFORE swapping to it, so a broken dependency resolve is caught while the
+# working release is still live, instead of becoming a crash loop after activation.
+if ! (cd "\$REL" && sudo -u \${APP_USER} "\$REL/.venv/bin/python" -c 'import app.__main__, uvicorn
+from app.server import create_app
+create_app()' >/dev/null 2>&1); then
+  say failed "the new version could not start (a dependency problem) and was not applied — staying on the current one"
+  rm -rf "\$REL"; exit 0
+fi
 say running "switching over"
 ln -sfn "\$REL" "\$APP_HOME"; chown -h \${APP_USER}:\${APP_USER} "\$APP_HOME" 2>/dev/null || true
 systemctl restart ${APP}.service
-ready=0; for i in \$(seq 1 30); do curl -sf "http://localhost:\${WEB_PORT}/healthz" >/dev/null 2>&1 && { ready=1; break; }; sleep 1; done
+# 45s, matching the installer: a Pi takes ~13s to import and bind, and a slow or busy
+# device must not be rolled back merely for being slow.
+ready=0; for i in \$(seq 1 45); do curl -sf "http://localhost:\${WEB_PORT}/healthz" >/dev/null 2>&1 && { ready=1; break; }; sleep 1; done
 if [ "\$ready" = 1 ]; then
   systemctl restart ${APP}-kiosk.service   # reload the kiosk so a new screen.html shows
   say done "updated and verified healthy"
@@ -1050,6 +1076,10 @@ if [ "$CHECK_ONLY" != 1 ]; then
   if [ "$_healthy" = 1 ]; then
     ok "new version is up and answering /healthz"
     [ -n "${PREV_REL:-}" ] && update_status done "Updated successfully."
+    # Only now that this release is proven healthy: keep the newest few for rollback
+    # and prune the rest, never touching the one we'd roll back to.
+    ls -1dt "${RELEASES}"/rel-* 2>/dev/null | tail -n +4 \
+      | { [ -n "${PREV_REL:-}" ] && grep -vxF "$PREV_REL" || cat; } | xargs -r rm -rf || true
   elif [ -n "${PREV_REL:-}" ] && [ -d "$PREV_REL" ]; then
     warn "the new version did not answer /healthz — rolling back to the previous release"
     ln -sfn "$PREV_REL" "$APP_HOME"; chown -h "$APP_USER":"$APP_USER" "$APP_HOME" 2>/dev/null || true
