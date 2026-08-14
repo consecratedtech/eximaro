@@ -38,6 +38,19 @@ warn() { echo "$(c '0;33' 'warn ') $*"; }
 die()  { echo "$(c '0;31' 'FAIL ') $*" >&2; exit 1; }
 step() { echo; echo "$(c '1;36' "==> $*")"; }
 
+# Install a helper script only if the source is non-empty, and keep any working copy
+# already on the device otherwise. An empty script is still executable: it runs, exits
+# 0, and does nothing — which is how a truncated download once replaced the updater
+# with a no-op and left the device with no way to update itself.
+install_script() {
+  if [ -s "$1" ]; then
+    install -m 0755 "$1" "$2"
+  else
+    warn "refusing to install an empty $(basename "$2") — keeping the existing one"
+    return 0
+  fi
+}
+
 # Record the update outcome where the RUNNING app can see it, so a failed/rolled-back
 # update is never silent — the panel shows a banner and the screen shows a notice.
 # Same file + format the in-app updater writes. detail is sanitised so an error
@@ -416,6 +429,21 @@ elif [ -n "$REPO_URL" ]; then
 else
   die "no app source found. Run from the cloned repo, or set REPO_URL when piping."
 fi
+
+# Refuse to install from an incomplete source tree. A download interrupted by a weak
+# network can leave files EMPTY rather than missing, and an empty file installs
+# perfectly happily — that is how a device once ended up with a 0-byte
+# ${APP}-update-full: a script that "runs" fine and silently does nothing, leaving the
+# operator with no way to update. Check the pieces we copy out verbatim are present
+# AND non-empty, before anything on the device is touched.
+for _f in requirements.txt update.sh app/server.py app/__main__.py \
+          helpers/eximaro-wifi helpers/eximaro-set-url app/pages/screen.html; do
+  [ -s "${SRC_DIR}/${_f}" ] || die "the downloaded copy is incomplete (${_f} is missing or empty).
+       Nothing on this device was changed. This usually means a weak connection during
+       the download — try again on a stronger network."
+done
+ok "source tree looks complete"
+
 REL="${RELEASES}/rel-$(date +%s)"
 rm -rf "$REL"; mkdir -p "$REL"
 cp -a "${SRC_DIR}/." "$REL/"
@@ -863,12 +891,12 @@ ok "self-update helper installed (atomic release swap, auto-rollback on failure)
 # The app drops a JSON request in the data dir; this path unit runs the helper,
 # which performs the one action and writes the result back for the app to read.
 step "Installing the WiFi setup helper"
-install -m 0755 "${SRC_DIR}/helpers/eximaro-wifi" "/usr/local/sbin/${APP}-wifi"
+install_script "${SRC_DIR}/helpers/eximaro-wifi" "/usr/local/sbin/${APP}-wifi"
 
 # Remote content command: `sudo eximaro-set-url <url>` adds a link (Google Slides
 # deck, page, or video) to a device and pushes it out on a controller; --replace
 # wipes the current content first. Handy for managing a fleet over SSH / an RMM.
-install -m 0755 "${SRC_DIR}/helpers/eximaro-set-url" "/usr/local/sbin/${APP}-set-url"
+install_script "${SRC_DIR}/helpers/eximaro-set-url" "/usr/local/sbin/${APP}-set-url"
 
 # Captive portal for the setup network: NetworkManager's shared-mode dnsmasq resolves
 # every hostname to the gateway (10.42.0.1) so a joined phone's connectivity probe
@@ -886,7 +914,7 @@ ok "captive-portal DNS installed (setup network only)"
 
 # A one-command full updater: pulls the latest from GitHub and re-runs install.sh
 # (delivers the app AND these system pieces, unlike the in-app "Update now").
-install -m 0755 "${SRC_DIR}/update.sh" "/usr/local/sbin/${APP}-update-full"
+install_script "${SRC_DIR}/update.sh" "/usr/local/sbin/${APP}-update-full"
 
 cat > "/etc/systemd/system/${APP}-wifi.service" <<EOF
 [Unit]
