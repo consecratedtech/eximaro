@@ -43,12 +43,23 @@ step() { echo; echo "$(c '1;36' "==> $*")"; }
 # 0, and does nothing — which is how a truncated download once replaced the updater
 # with a no-op and left the device with no way to update itself.
 install_script() {
-  if [ -s "$1" ]; then
-    install -m 0755 "$1" "$2"
-  else
+  if [ ! -s "$1" ]; then
     warn "refusing to install an empty $(basename "$2") — keeping the existing one"
     return 0
   fi
+  # Write beside the target, then RENAME over it. Never write in place: one of these
+  # targets is ${APP}-update-full, i.e. the very script running this update. install(1)
+  # truncates the destination first, and bash reads a script lazily from that same
+  # inode — so overwriting it mid-run corrupts the running update, and an interruption
+  # between truncate and write leaves a 0-byte file: an "updater" that runs, exits 0,
+  # and does nothing. rename() swaps in a new inode atomically, so the running shell
+  # keeps reading the old one safely and the target is never half-written.
+  _is_tmp="$2.new.$$"
+  cp "$1" "$_is_tmp" && chmod 0755 "$_is_tmp" && mv -f "$_is_tmp" "$2" || {
+    rm -f "$_is_tmp"
+    warn "could not update $(basename "$2") — keeping the existing one"
+    return 0
+  }
 }
 
 # Record the update outcome where the RUNNING app can see it, so a failed/rolled-back
