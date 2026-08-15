@@ -132,6 +132,20 @@ for p in chromium chromium-browser; do
 done
 [ -n "$CHROMIUM_PKG" ] && ok "chromium package: ${CHROMIUM_PKG}" || warn "no chromium package found in apt"
 
+# Pointer. A TV's HDMI-CEC channel registers as an input device with relative X/Y
+# axes, so the screen thinks a mouse is attached and parks a cursor in the middle of
+# it. Report both halves: whether this device has such a phantom mouse, and whether
+# the transparent cursor set that hides it is in place.
+if grep -qs 'REL=3' /proc/bus/input/devices; then
+  ok "a display advertises a pointer (normal — HDMI-CEC does this; the cursor is hidden below)"
+fi
+if [ -s "/usr/share/${APP}/cursors/_blank/cursors/left_ptr" ] \
+   && [ -e "/usr/share/${APP}/cursors/default/cursors/left_ptr" ]; then
+  ok "pointer hidden (transparent cursor set installed)"
+else
+  warn "no transparent cursor set yet — a mouse pointer can show on screen; installing fixes this"
+fi
+
 if [ "$CHECK_ONLY" -eq 1 ]; then
   step "Check-only mode: stopping before any changes."
   exit 0
@@ -422,11 +436,21 @@ ok "audio routed to HDMI (PipeWire); videos with 'Play sound' will use it"
 # what gets drawn; use real-size ones).
 step "Hiding the mouse cursor"
 CURSOR_DIR="/usr/share/${APP}/cursors"
-rm -rf "$CURSOR_DIR"
-install -d -m 0755 "${CURSOR_DIR}/_blank/cursors"
-python3 - "$CURSOR_DIR" <<'PY'
-import struct, sys
-# One fully-transparent image per nominal size an xcursor loader may ask for.
+
+# Runs in a subshell so a failure can be caught. Every step propagates its own error
+# with an explicit `|| exit 1` rather than leaning on `set -e`: errexit is SUSPENDED
+# inside a function called from an `if` condition (even one that re-runs `set -e`),
+# so relying on it here would silently sail past a failed step and report success.
+build_blank_cursors() (
+  # Built in place, never rm -rf'd first: the kiosk reads this directory when cage and
+  # Chromium start, and a re-run must not leave even a split second where it is missing
+  # (a theme that loads nothing falls back to a built-in arrow). Every write below is
+  # an atomic rename or an atomic symlink swap, so the set is always complete.
+  install -d -m 0755 "${CURSOR_DIR}/_blank/cursors" || exit 1
+  python3 - "$CURSOR_DIR" <<'PY' || exit 1
+import os, struct, sys
+# One fully-transparent image per nominal size an xcursor loader may ask for. These
+# are real-size images on purpose: a 1x1 parses fine but is not what gets drawn.
 sizes = [16, 24, 32, 48, 64]
 chunks = [struct.pack('<IIIIIIIII', 36, 0xfffd0002, s, 1, s, s, 0, 0, 0) + b'\0' * (s * s * 4)
           for s in sizes]
@@ -436,12 +460,19 @@ offs = []
 for c in chunks:
     offs.append(pos); pos += len(c)
 toc = b''.join(struct.pack('<III', 0xfffd0002, s, o) for s, o in zip(sizes, offs))
-open(sys.argv[1] + '/_blank/cursors/left_ptr', 'wb').write(hdr + toc + b''.join(chunks))
+dest = sys.argv[1] + '/_blank/cursors/left_ptr'
+tmp = dest + '.new'
+with open(tmp, 'wb') as fh:
+    fh.write(hdr + toc + b''.join(chunks))
+    fh.flush()
+    os.fsync(fh.fileno())
+os.chmod(tmp, 0o644)
+os.replace(tmp, dest)   # atomic: readers see the old file or the new one, never a partial one
 PY
-# Every cursor name a browser, toolkit or compositor might request -> the same
-# invisible image. A name that is missing falls through to a real theme, which is
-# exactly how the pointer came back, so this list is deliberately exhaustive.
-( cd "${CURSOR_DIR}/_blank/cursors"
+  # Every cursor name a browser, toolkit or compositor might request -> the same
+  # invisible image. A name that is missing falls through to a real theme, which is
+  # exactly how the pointer came back, so this list is deliberately exhaustive.
+  cd "${CURSOR_DIR}/_blank/cursors" || exit 1
   for n in default pointer arrow top_left_arrow left_ptr_watch xterm text ibeam hand hand1 hand2 \
            pointing_hand grab grabbing openhand closedhand watch wait progress crosshair cross \
            fleur move all-scroll col-resize row-resize size_all size_ver size_hor n-resize \
@@ -451,16 +482,33 @@ PY
            vertical-text right_ptr center_ptr sb_h_double_arrow sb_v_double_arrow \
            bottom_left_corner bottom_right_corner top_left_corner top_right_corner \
            left_side right_side top_side bottom_side X_cursor; do
-    ln -sf left_ptr "$n"
-  done )
-# The theme names Chromium/GTK actually reach for. None of them inherit anything,
-# so the chain can never walk out of this directory into a real cursor set.
-for _t in default Adwaita AdwaitaLegacy hicolor; do
-  install -d -m 0755 "${CURSOR_DIR}/${_t}"
-  ln -sfn "${CURSOR_DIR}/_blank/cursors" "${CURSOR_DIR}/${_t}/cursors"
-  printf '[Icon Theme]\nName=%s\nComment=eximaro: a sign has no pointer\n' "$_t" \
-    > "${CURSOR_DIR}/${_t}/index.theme"
-done
+    ln -sf left_ptr "$n" || exit 1
+  done
+  # The theme names Chromium/GTK actually reach for. None of them inherit anything,
+  # so the chain can never walk out of this directory into a real cursor set.
+  for _t in default Adwaita AdwaitaLegacy hicolor; do
+    install -d -m 0755 "${CURSOR_DIR}/${_t}" || exit 1
+    # If an older run (or a stray hand) left a real directory here, ln would nest a
+    # link inside it instead of replacing it. rm on a symlink drops only the link.
+    [ -L "${CURSOR_DIR}/${_t}/cursors" ] || rm -rf "${CURSOR_DIR}/${_t}/cursors" || exit 1
+    ln -sfn "${CURSOR_DIR}/_blank/cursors" "${CURSOR_DIR}/${_t}/cursors" || exit 1
+    printf '[Icon Theme]\nName=%s\nComment=eximaro: a sign has no pointer\n' "$_t" \
+      > "${CURSOR_DIR}/${_t}/index.theme" || exit 1
+  done
+  # Prove it before claiming it: the file must exist, be non-empty, and be reachable
+  # through the theme name the kiosk asks for.
+  [ -s "${CURSOR_DIR}/_blank/cursors/left_ptr" ] || exit 1
+  [ -e "${CURSOR_DIR}/default/cursors/left_ptr" ] || exit 1
+)
+
+# A hidden pointer is cosmetic. It must never be the reason an update — which may
+# carry a fix that actually matters — stops half-way on an unattended screen.
+if build_blank_cursors; then
+  ok "pointer hidden (every cursor theme resolves to a transparent image)"
+else
+  warn "could not build the transparent cursor set — a mouse pointer may show on"
+  warn "screen; everything else was installed normally"
+fi
 # Undo the older attempt (a "blank" theme dropped into the system icon dirs). It
 # never worked, and leaving a symlink inside a packaged directory behind is rude.
 if [ -L /usr/share/icons/default/cursors ] \
@@ -468,7 +516,6 @@ if [ -L /usr/share/icons/default/cursors ] \
   rm -f /usr/share/icons/default/cursors
 fi
 rm -rf /usr/share/icons/blank
-ok "pointer hidden (every cursor theme resolves to a transparent image)"
 
 # ---- app code (A/B release) -------------------------------------------------
 # Each version installs into its own release dir under ${RELEASES}; ${APP_HOME} is
