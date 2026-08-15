@@ -12,8 +12,9 @@
 #   sudo ./uninstall.sh                       # remove eximaro (default)
 #
 # It only removes what this project created: things named after the app, plus the
-# service user. It deliberately leaves the blank cursor theme alone (the installer
-# recreates it) and never touches anything else on the system.
+# service user. Nothing else on the system is touched — in particular the system's
+# own cursor themes under /usr/share/icons are left exactly as they were, because
+# the transparent cursor set lives entirely in /usr/share/<app>/cursors.
 
 set -uo pipefail   # not -e: press on past pieces that are already gone
 
@@ -62,6 +63,11 @@ rm -f $CLIS
 
 echo "==> deleting app code (${APP_HOME}, ${RELEASES})"
 rm -rf "$APP_HOME" "$RELEASES"
+
+# The transparent cursor set the kiosk used. Ours, named after the app, so it goes
+# with the rest — the system's own themes under /usr/share/icons are untouched.
+echo "==> deleting the cursor set (/usr/share/${APP})"
+rm -rf "/usr/share/${APP}"
 
 if [ "$KEEP_DATA" -eq 1 ]; then
   echo "==> keeping ${DATA_DIR}"
