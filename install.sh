@@ -396,32 +396,79 @@ sudo -u "$APP_USER" env $_uenv systemctl --user start ${APP}-audio-hdmi.service 
 ok "audio routed to HDMI (PipeWire); videos with 'Play sound' will use it"
 
 # ---- hide the mouse cursor --------------------------------------------------
-# An eximaro screen has no operator, so the pointer must never show. cage ignores
-# XCURSOR_THEME and loads the system "default" xcursor theme regardless, so we
-# build a "blank" theme whose cursors are 1x1 fully-transparent images, alias
-# every common cursor name to it, then repoint /usr/share/icons/default at it.
-# (Pairing this with software cursors in the kiosk unit makes the blank theme
-# actually take effect — see the WLR_NO_HARDWARE_CURSORS note below.)
-step "Hiding the mouse cursor (blank xcursor theme)"
-install -d -m 0755 /usr/share/icons/blank/cursors
-python3 - <<'PY'
-import struct
-sizes=[16,24,32,48,64]; px=struct.pack('<I',0)
-chunks=[struct.pack('<IIIIIIIII',36,0xfffd0002,s,1,1,1,0,0,0)+px for s in sizes]
-hdr=b'Xcur'+struct.pack('<III',16,0x00010000,len(chunks))
-pos=16+len(chunks)*12; offs=[]
-for c in chunks: offs.append(pos); pos+=len(c)
-toc=b''.join(struct.pack('<III',0xfffd0002,s,o) for s,o in zip(sizes,offs))
-open('/usr/share/icons/blank/cursors/left_ptr','wb').write(hdr+toc+b''.join(chunks))
+# An eximaro screen has no operator, so the pointer must never show. Two facts,
+# both established on real hardware, decide how this has to be done:
+#
+#   1. There IS a pointer, even with nothing plugged in. A TV's HDMI-CEC channel
+#      registers as an input device that advertises REL_X/REL_Y (look for
+#      "vc4-hdmi-0" with REL=3 in /proc/bus/input/devices), so libinput classifies
+#      the television itself as a mouse and the compositor parks a pointer in the
+#      middle of the screen, where it sits forever because it never moves.
+#   2. Chromium picks its OWN cursor theme and ignores XCURSOR_THEME. Tracing it
+#      shows it reading /usr/share/icons/Adwaita/cursors — so a "blank" theme
+#      installed alongside the real ones does nothing, and neither does
+#      `cursor:none` in the page (Chromium only re-evaluates the CSS cursor on a
+#      pointer event, and this pointer never sends one).
+#
+# So instead of arguing with Chromium about which theme to use, point the cursor
+# SEARCH PATH at a directory we own in which every theme name it might ask for
+# resolves to fully-transparent images. Nothing under /usr/share/icons is touched,
+# an apt upgrade can't undo it, and whatever theme name is requested — including
+# one we never thought of, which falls back to "default" — comes out invisible.
+#
+# Things that do NOT work, so nobody re-tries them: a udev LIBINPUT_IGNORE_DEVICE
+# rule on the CEC device (the compositor then stops serving frames — the screen
+# capture blocks forever), and 1x1 transparent images (they parse fine but are not
+# what gets drawn; use real-size ones).
+step "Hiding the mouse cursor"
+CURSOR_DIR="/usr/share/${APP}/cursors"
+rm -rf "$CURSOR_DIR"
+install -d -m 0755 "${CURSOR_DIR}/_blank/cursors"
+python3 - "$CURSOR_DIR" <<'PY'
+import struct, sys
+# One fully-transparent image per nominal size an xcursor loader may ask for.
+sizes = [16, 24, 32, 48, 64]
+chunks = [struct.pack('<IIIIIIIII', 36, 0xfffd0002, s, 1, s, s, 0, 0, 0) + b'\0' * (s * s * 4)
+          for s in sizes]
+hdr = b'Xcur' + struct.pack('<III', 16, 0x00010000, len(chunks))
+pos = 16 + len(chunks) * 12
+offs = []
+for c in chunks:
+    offs.append(pos); pos += len(c)
+toc = b''.join(struct.pack('<III', 0xfffd0002, s, o) for s, o in zip(sizes, offs))
+open(sys.argv[1] + '/_blank/cursors/left_ptr', 'wb').write(hdr + toc + b''.join(chunks))
 PY
-( cd /usr/share/icons/blank/cursors
-  for n in default pointer arrow top_left_arrow left_ptr_watch xterm text ibeam hand hand1 hand2 pointing_hand grab grabbing openhand closedhand watch wait progress crosshair cross fleur move all-scroll col-resize row-resize size_all size_ver size_hor n-resize e-resize s-resize w-resize ne-resize nw-resize se-resize sw-resize not-allowed no-drop forbidden help question_arrow context-menu copy alias; do
+# Every cursor name a browser, toolkit or compositor might request -> the same
+# invisible image. A name that is missing falls through to a real theme, which is
+# exactly how the pointer came back, so this list is deliberately exhaustive.
+( cd "${CURSOR_DIR}/_blank/cursors"
+  for n in default pointer arrow top_left_arrow left_ptr_watch xterm text ibeam hand hand1 hand2 \
+           pointing_hand grab grabbing openhand closedhand watch wait progress crosshair cross \
+           fleur move all-scroll col-resize row-resize size_all size_ver size_hor n-resize \
+           e-resize s-resize w-resize ne-resize nw-resize se-resize sw-resize ew-resize \
+           ns-resize nesw-resize nwse-resize not-allowed no-drop forbidden dnd-none dnd-copy \
+           dnd-move dnd-link help question_arrow context-menu copy alias zoom-in zoom-out cell \
+           vertical-text right_ptr center_ptr sb_h_double_arrow sb_v_double_arrow \
+           bottom_left_corner bottom_right_corner top_left_corner top_right_corner \
+           left_side right_side top_side bottom_side X_cursor; do
     ln -sf left_ptr "$n"
   done )
-printf '[Icon Theme]\nName=blank\nComment=Invisible cursor for kiosk\n' > /usr/share/icons/blank/index.theme
-install -d -m 0755 /usr/share/icons/default
-ln -sfn /usr/share/icons/blank/cursors /usr/share/icons/default/cursors
-ok "blank cursor theme installed and set as the system default"
+# The theme names Chromium/GTK actually reach for. None of them inherit anything,
+# so the chain can never walk out of this directory into a real cursor set.
+for _t in default Adwaita AdwaitaLegacy hicolor; do
+  install -d -m 0755 "${CURSOR_DIR}/${_t}"
+  ln -sfn "${CURSOR_DIR}/_blank/cursors" "${CURSOR_DIR}/${_t}/cursors"
+  printf '[Icon Theme]\nName=%s\nComment=eximaro: a sign has no pointer\n' "$_t" \
+    > "${CURSOR_DIR}/${_t}/index.theme"
+done
+# Undo the older attempt (a "blank" theme dropped into the system icon dirs). It
+# never worked, and leaving a symlink inside a packaged directory behind is rude.
+if [ -L /usr/share/icons/default/cursors ] \
+   && [ "$(readlink /usr/share/icons/default/cursors)" = "/usr/share/icons/blank/cursors" ]; then
+  rm -f /usr/share/icons/default/cursors
+fi
+rm -rf /usr/share/icons/blank
+ok "pointer hidden (every cursor theme resolves to a transparent image)"
 
 # ---- app code (A/B release) -------------------------------------------------
 # Each version installs into its own release dir under ${RELEASES}; ${APP_HOME} is
@@ -617,12 +664,15 @@ UtmpMode=user
 # aimed the kiosk away from the PipeWire sockets in the app user's own runtime dir.
 Environment=XDG_RUNTIME_DIR=/run/user/${APP_UID}
 Environment=XDG_SESSION_TYPE=wayland
-# Hide the pointer: software cursors + the blank "default" theme (installed above)
-# make it invisible. cage otherwise draws a GPU hardware cursor that ignores the
-# theme, so WLR_NO_HARDWARE_CURSORS forces wlroots to render the (blank) cursor.
+# Hide the pointer. XCURSOR_PATH is the load-bearing line: it REPLACES the search
+# path, so both the compositor and Chromium can only find the transparent cursor
+# set built above — pointing it at /usr/share/icons instead lets Chromium reach
+# Adwaita and a real arrow appears in the middle of the screen. cage would
+# otherwise draw a GPU hardware cursor that ignores the theme entirely, so
+# WLR_NO_HARDWARE_CURSORS makes wlroots render the (blank) one instead.
 Environment=WLR_NO_HARDWARE_CURSORS=1
-Environment=XCURSOR_THEME=blank
-Environment=XCURSOR_PATH=/usr/share/icons
+Environment=XCURSOR_THEME=default
+Environment=XCURSOR_PATH=/usr/share/${APP}/cursors
 Environment=XCURSOR_SIZE=24
 # Wait until the web app actually answers before launching the browser. systemd
 # treats ${APP}.service as "started" the moment the process spawns, but uvicorn

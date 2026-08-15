@@ -13,6 +13,13 @@
   html,body{margin:0;height:100%;background:var(--d-bg,#101214);overflow:hidden;
     font-family:"Hanken Grotesk",system-ui,sans-serif;color:var(--d-ink,#EDEFF1);
     -webkit-font-smoothing:antialiased}
+  /* Belt-and-braces only: what actually hides the pointer is the transparent cursor
+     set install.sh builds and aims XCURSOR_PATH at. This rule does NOT fix the
+     "arrow stuck in the middle of the screen" on its own — Chromium re-evaluates the
+     CSS cursor only when the pointer moves, and the phantom pointer a TV's HDMI-CEC
+     channel creates never moves. It earns its place for a real mouse someone plugs
+     in to poke at a screen. */
+  *{cursor:none}
   #stage{position:fixed;inset:0;background:#000;overflow:hidden}
   /* Each playlist item lives in its own absolutely-stacked layer. Layers are
      built once and kept mounted; switching items crossfades opacity so there is
