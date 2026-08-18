@@ -13,6 +13,7 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from . import config, convert
@@ -144,8 +145,12 @@ def _count_slides(url: str) -> int:
     # Don't auto-advance while measuring — we only want the 'of N' total, and that
     # doesn't change as the deck plays, so let it sit on the first slide.
     measure_url = re.sub(r"start=(?:true|1)", "start=false", url)
-    profile = tempfile.mkdtemp(prefix="eximaro-measure-")
+    # Everything that can touch the disk or the network lives inside the try: this
+    # runs as a fire-and-forget background task, where an escaping exception is
+    # invisible and would strand the item mid-measurement.
+    profile = ""
     try:
+        profile = tempfile.mkdtemp(prefix="eximaro-measure-")
         dom = subprocess.run(
             [browser, "--headless=new", "--no-sandbox", "--disable-gpu",
              "--disable-dev-shm-usage", "--hide-scrollbars", "--no-first-run",
@@ -156,7 +161,8 @@ def _count_slides(url: str) -> int:
     except Exception:
         return 0
     finally:
-        shutil.rmtree(profile, ignore_errors=True)
+        if profile:
+            shutil.rmtree(profile, ignore_errors=True)
     m = re.search(r"[Ss]lide\s+\d+\s+of\s+(\d+)", dom)
     n = int(m.group(1)) if m else 0
     return n if 1 <= n <= 500 else 0
@@ -198,10 +204,19 @@ def add_url(url: str, seconds: int = DEFAULT_URL_SECONDS, name: str = "") -> dic
         })
     url = _slides_autoplay(url)
     label = name.strip() or ("Google Slides" if _is_google_slides(url) else url)
-    return _append({
+    item = {
         "id": secrets.token_hex(4), "type": "url", "ref": url,
         "seconds": int(seconds), "name": label,
-    })
+    }
+    # A published deck is sized by a headless browser moments after this returns.
+    # Record that the attempt is under way, stamped with the time: the panel shows
+    # "reading its length" and waits, instead of reading "length not read yet" from
+    # the instant the row appears, which looks like nothing is happening. The stamp
+    # is what makes it safe — the panel stops waiting on its own once it is old,
+    # so a measurement that dies can never leave a row spinning forever.
+    if _is_google_slides(url) and _slides_per_slide_ms(url) > 0:
+        item["measuring"] = int(time.time())
+    return _append(item)
 
 
 def add_video(filename: str, data: bytes, seconds: int = 0) -> dict:
@@ -228,6 +243,22 @@ def add_video_path(filename: str, src_path) -> dict:
     })
 
 
+# How long a deck measurement is allowed to look "in progress" in the panel. The
+# headless browser is capped at 45s, plus browser start-up on a slow Pi; past this
+# the attempt is treated as gone regardless of what the item still says, so a task
+# that was killed (a reboot mid-measure, say) can't leave a row spinning for ever.
+MEASURE_GRACE = 150
+
+
+def measuring(item: dict) -> bool:
+    """Is this item's automatic timing still being read? False once the attempt has
+    finished, and false once it is simply too old to still be running."""
+    started = item.get("measuring")
+    if not isinstance(started, int):
+        return False
+    return 0 <= (int(time.time()) - started) <= MEASURE_GRACE
+
+
 def measure_slides(item_id: str) -> dict:
     """Network step, run right after adding a URL: for a Google Slides item, size
     its on-screen time to the whole deck — slide count x the per-slide delay from
@@ -245,18 +276,23 @@ def measure_slides(item_id: str) -> dict:
     # the operator makes during the measurement (this now runs as a background task)
     # isn't clobbered by a stale write, and a deleted item is never resurrected.
     n, per = _slides_plan(target["ref"])
-    if not (n and per):
-        return target
     items = _load()
     for it in items:
-        if it["id"] == item_id:
+        if it["id"] != item_id:
+            continue
+        # The attempt is over either way, so always clear the in-progress marker. On
+        # failure that is the whole point: the row stops saying "reading its length"
+        # and offers the manual re-check instead, rather than waiting on a result
+        # that is never coming.
+        it.pop("measuring", None)
+        if n and per:
             it["slides"] = n
             it["per_slide"] = per
             # Size to show EVERY slide: deck time + a buffer for the initial load and
             # Google's own timing drift. loop=true keeps it cycling, so it's never cut off.
             it["seconds"] = (n + 1) * per + 15
-            _save(items)
-            return it
+        _save(items)
+        return it
     return {}   # removed while we were measuring — nothing to write back
 
 

@@ -585,6 +585,13 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
         activity.log("Added a link to the playlist", url)
         return RedirectResponse(_content_back(), status_code=303)
 
+    @app.get("/api/content/measuring")
+    def content_measuring():
+        """How many decks are still being timed. The Content page polls this after a
+        link is added and refreshes itself when the count reaches zero, so the row
+        turns from "reading the deck" into "auto" without anyone clicking anything."""
+        return {"pending": sum(1 for it in library.list_items() if library.measuring(it))}
+
     @app.post("/api/content/upload")
     async def add_upload(background: BackgroundTasks, file: UploadFile,
                          seconds: int = Form(library.DEFAULT_IMAGE_SECONDS)):
@@ -983,6 +990,13 @@ _CSS = """
     color:var(--muted);cursor:pointer;line-height:1.4}
   .item .copy:hover{border-color:var(--accent);color:var(--accent-text)}
   .slidenote{flex-basis:100%;width:100%;font:.72rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);margin-top:2px}
+  /* A deck being timed right now. A quiet pulsing dot, not a spinner: a row that is
+     still working has to look different from one that gave up and wants a click. */
+  .slidenote.measuring{color:var(--accent-text);display:flex;align-items:center;gap:7px}
+  .slidenote.measuring .dot{width:8px;height:8px;border-radius:50%;background:currentColor;
+    flex:0 0 auto;animation:emx-pulse 1.1s ease-in-out infinite}
+  @keyframes emx-pulse{0%,100%{opacity:.25}50%{opacity:1}}
+  @media(prefers-reduced-motion:reduce){.slidenote.measuring .dot{animation-duration:3s}}
   .secs.auto{font:.72rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);align-self:center;padding:8px 10px}
   /* Sound / captions toggles for a video or YouTube item */
   .item .mtogs{flex-basis:100%;width:100%;display:flex;flex-wrap:wrap;gap:16px;margin-top:4px}
@@ -1694,6 +1708,10 @@ def _content_body(cfg: dict, displays=None) -> str:
             is_video = it["type"] == "video"
             is_slides_raw = (it["type"] == "url" and not it.get("slides")
                              and library._is_google_slides(it.get("ref", "")))
+            # Still being sized by the headless browser. Time-boxed on purpose: if the
+            # measurement died without clearing its marker, the row quietly falls back
+            # to the manual re-check below instead of spinning for ever.
+            is_measuring = is_slides_raw and library.measuring(it)
             secs_form = f"""
                 <form class="secs" method="post" action="/api/content/seconds">
                   <input type="hidden" name="item_id" value="{it['id']}">
@@ -1721,6 +1739,14 @@ def _content_body(cfg: dict, displays=None) -> str:
                          title="Seconds (0 = play the whole video)" aria-label="Seconds (0 = play the whole video)">
                   <button class="btn-ghost set" title="Save time">Set</button>
                 </form>"""
+            elif is_measuring:
+                note = ('<span class="slidenote measuring"><span class="dot"></span>'
+                        'Reading the deck to time it automatically&hellip; '
+                        'this takes a few seconds</span>')
+                # No re-check button while it is already running — offering it would
+                # invite a second headless browser on top of the first. The manual
+                # seconds box stays, so nobody is ever stuck waiting.
+                secs_html = secs_form.replace("{title}", "Or set the seconds by hand")
             elif is_slides_raw:
                 note = ('<span class="slidenote">&#9654; Google Slides &mdash; haven\'t read its '
                         'length yet; re-check while online, or set the seconds by hand</span>')
@@ -1838,6 +1864,27 @@ def _content_body(cfg: dict, displays=None) -> str:
         {shuffle_row}
         {playlist_inner}
       </div>
+      <script>
+      // A deck added a moment ago is still being timed by a headless browser, which
+      // finishes AFTER this page was sent. Watch for it and refresh once, so the row
+      // turns into "auto" by itself. Without this the page kept saying "length not
+      // read yet" until someone reloaded or pressed Re-check, which is what made the
+      // automatic timing look like it wasn't working at all.
+      (function(){{
+        if(!document.querySelector('.slidenote.measuring')) return;
+        var tries=0;
+        var iv=setInterval(async function(){{
+          tries++;
+          try{{
+            var s=await (await fetch('/api/content/measuring',{{cache:'no-store'}})).json();
+            if(!s||s.pending===0){{clearInterval(iv);location.reload();return;}}
+          }}catch(e){{}}
+          // Longer than the server's own grace period, so the reload lands once the
+          // row has already fallen back to the manual re-check and we don't re-arm.
+          if(tries>72){{clearInterval(iv);location.reload();}}
+        }},2500);
+      }})();
+      </script>
     """
 
 

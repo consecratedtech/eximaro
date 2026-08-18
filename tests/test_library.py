@@ -478,3 +478,64 @@ def test_measure_slides_does_not_resurrect_a_removed_deck(monkeypatch):
 
     assert library.measure_slides(deck["id"]) == {}     # nothing to write back
     assert deck["id"] not in [i["id"] for i in library.list_items()]
+
+
+# --- deck timing: "measuring" state -----------------------------------------
+# The panel shows "reading the deck" and refreshes itself off the back of this
+# marker, so the states it can be in matter more than the measurement itself.
+
+SLIDES = ("https://docs.google.com/presentation/d/e/2PACX-abc/pub"
+          "?start=true&loop=true&delayms=10000")
+
+
+def test_adding_a_slides_deck_marks_it_as_being_measured():
+    item = library.add_url(SLIDES)
+    assert library.measuring(item) is True
+
+
+def test_a_plain_link_is_never_marked_as_being_measured():
+    assert library.measuring(library.add_url("example.com")) is False
+    assert "measuring" not in library.add_url("example.com")
+
+
+def test_a_bare_slides_link_still_gets_measured():
+    # add_url gives a Slides link default auto-advance timing, so even a link with
+    # no delayms of its own has something to size the deck from — it must not be
+    # left in the "set the seconds by hand" state.
+    item = library.add_url("https://docs.google.com/presentation/d/e/2PACX-abc/pub")
+    assert "delayms=" in item["ref"]
+    assert library.measuring(item) is True
+
+
+def test_measuring_gives_up_on_a_stale_marker():
+    # A measurement killed mid-flight (a reboot, say) must never leave the panel
+    # spinning: past the grace period the item reads as "not measuring" whatever
+    # the stored marker says.
+    import time as _t
+    fresh = {"measuring": int(_t.time())}
+    stale = {"measuring": int(_t.time()) - (library.MEASURE_GRACE + 1)}
+    assert library.measuring(fresh) is True
+    assert library.measuring(stale) is False
+    assert library.measuring({}) is False
+    assert library.measuring({"measuring": "soon"}) is False
+
+
+def test_a_failed_measurement_clears_the_marker(monkeypatch):
+    # Offline / unreadable deck: the row has to fall back to the manual re-check
+    # instead of waiting for a result that is never coming.
+    item = library.add_url(SLIDES)
+    monkeypatch.setattr(library, "_count_slides", lambda url: 0)
+    out = library.measure_slides(item["id"])
+    assert library.measuring(out) is False
+    assert "slides" not in out
+    stored = next(i for i in library.list_items() if i["id"] == item["id"])
+    assert "measuring" not in stored          # cleared on disk, not just in memory
+
+
+def test_a_successful_measurement_clears_the_marker_and_sizes_the_deck(monkeypatch):
+    item = library.add_url(SLIDES)
+    monkeypatch.setattr(library, "_count_slides", lambda url: 8)
+    out = library.measure_slides(item["id"])
+    assert library.measuring(out) is False
+    assert out["slides"] == 8 and out["per_slide"] == 10
+    assert out["seconds"] == (8 + 1) * 10 + 15
