@@ -39,6 +39,25 @@ PORT = int(os.environ.get("EXIMARO_PORT", "8080"))
 # Release/build identifier — surfaced in /healthz. Bump on each tagged release.
 BUILD_TAG = "emx-b1-9f3k7q2x8v4"
 
+
+def _read_version() -> str:
+    """The exact source this release was built from, written by install.sh beside the
+    app code. This is what answers "is this device on the current code?" — nothing
+    else could: BUILD_TAG is a fixed string, and the release directory name records
+    only WHEN an update ran, not WHAT it installed. Falls back to "unknown" so a
+    release laid down by an older installer, or a plain dev checkout, still starts.
+    Read once at import: it describes the files on disk, which cannot change under a
+    running process (an update builds a NEW release dir and swaps the symlink)."""
+    try:
+        text = (Path(__file__).resolve().parent.parent / "VERSION").read_text()
+    except OSError:
+        return "unknown"
+    first = text.strip().splitlines()[0].strip() if text.strip() else ""
+    return first[:120] or "unknown"
+
+
+VERSION = _read_version()
+
 CONFIG_PATH = DATA / "config.json"
 VALID_ROLES = {"controller", "display"}
 

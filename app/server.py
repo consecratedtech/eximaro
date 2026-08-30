@@ -291,7 +291,8 @@ def create_app() -> FastAPI:
 
     @app.get("/healthz")
     def healthz():
-        return {"ok": True, "device_id": device_id, "build": config.BUILD_TAG}
+        return {"ok": True, "device_id": device_id, "build": config.BUILD_TAG,
+                "version": config.VERSION}
 
     @app.get("/", response_class=HTMLResponse)
     def home():
@@ -1635,7 +1636,9 @@ def _health_body(cfg: dict, role: str, device_id: str, started: float) -> str:
     row("Role", _esc((role or "unset").capitalize()))
     row("Device ID", f'<span class="mono">{_esc(device_id[:12])}…</span>')
     row("Address", f'<a href="{_esc(url)}">{_esc(url)}</a>')
-    row("App version", _esc(APP_VERSION))
+    # The packaged version string has read 0.0.1 on every build ever made, so it
+    # can't answer "is this screen on the current code?". The source stamp can.
+    row("Software", f'<span class="mono">{_esc(config.VERSION)}</span>')
     row("Uptime", _esc(_fmt_uptime(time.time() - started)))
 
     if role == "controller":

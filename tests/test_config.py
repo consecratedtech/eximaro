@@ -93,3 +93,33 @@ def test_load_config_corrupt_json_falls_back_to_env(monkeypatch):
     cfg = config.load_config()
     # Unparseable file -> fall back to env defaults, not a crash.
     assert cfg["role"] == "controller"
+
+
+# --- source version stamp ----------------------------------------------------
+# install.sh writes a VERSION file beside the app package so a device can answer
+# "am I on the current code?" itself, instead of the answer having to be worked
+# out by comparing an update timestamp against commit times by hand.
+
+def test_version_stamp_is_read_written_and_degrades_safely():
+    import importlib
+    from pathlib import Path
+    from app import config as cfg
+
+    stamp = Path(cfg.__file__).resolve().parent.parent / "VERSION"
+    assert not stamp.exists(), "a stray VERSION file is checked in"
+    try:
+        # missing (a plain dev checkout) must not raise
+        assert cfg._read_version() == "unknown"
+
+        stamp.write_text("8ee2183 installed 2026-08-30T09:20:00-04:00\n")
+        importlib.reload(cfg)
+        assert cfg.VERSION.startswith("8ee2183")
+
+        # a truncated or empty stamp must degrade, never crash the app on boot
+        stamp.write_text("")
+        importlib.reload(cfg)
+        assert cfg.VERSION == "unknown"
+    finally:
+        if stamp.exists():
+            stamp.unlink()
+        importlib.reload(cfg)

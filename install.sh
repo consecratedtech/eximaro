@@ -556,8 +556,22 @@ cp -a "${SRC_DIR}/." "$REL/"
 # absolute-path shebangs from the source checkout (breaks pip), and .git is dead
 # weight on the appliance. The venv below is always built fresh.
 rm -rf "$REL/.venv" "$REL/.git"
+# Record exactly what this release was built from, so a device can answer "am I on
+# the current code?" on its own. Nothing else could: BUILD_TAG is a fixed string,
+# and the release directory name says only WHEN an update ran, not WHAT it laid
+# down — leaving the answer to be cross-referenced against commit times by hand.
+# Read from the SOURCE tree: .git was just stripped out of the release above.
+_ver="$(git -C "$SRC_DIR" rev-parse --short=8 HEAD 2>/dev/null || true)"
+if [ -n "$_ver" ]; then
+  # Flag a tree that was edited on top of that commit, so a hand-patched device
+  # never reports a clean version it doesn't actually match.
+  git -C "$SRC_DIR" diff --quiet HEAD 2>/dev/null || _ver="${_ver}+local"
+else
+  _ver="unknown"        # installed from a tarball, or git isn't present
+fi
+printf '%s installed %s\n' "$_ver" "$(date -Is)" > "$REL/VERSION"
 chown -R "$APP_USER":"$APP_USER" "$REL"
-ok "release staged at ${REL}"
+ok "release staged at ${REL} (source ${_ver})"
 
 step "Setting up Python environment (venv — required on trixie/PEP 668)"
 sudo -u "$APP_USER" python3 -m venv --clear "$REL/.venv"
