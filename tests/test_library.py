@@ -539,3 +539,65 @@ def test_a_successful_measurement_clears_the_marker_and_sizes_the_deck(monkeypat
     assert library.measuring(out) is False
     assert out["slides"] == 8 and out["per_slide"] == 10
     assert out["seconds"] == (8 + 1) * 10 + 15
+
+
+# --- remove keys on the immutable id, never index or ref ---------------------
+# From the 2026-08-21 field report: "removing the old link appears to remove the
+# new one instead". These lock the identity contract so it can't regress.
+
+def test_remove_takes_the_item_asked_for_not_the_one_beside_it():
+    a = library.add_url("https://example.com/a")
+    b = library.add_url("https://example.com/b")
+    library.remove(a["id"])
+    left = [i["id"] for i in library.list_items()]
+    assert left == [b["id"]]
+
+
+def test_the_same_slides_link_added_twice_stays_two_separate_items():
+    # Slides URLs are normalized, so both refs come out identical — if remove keyed
+    # on the URL instead of the id this would take out both (or the wrong one).
+    first = library.add_url(SLIDES)
+    second = library.add_url(SLIDES)
+    assert first["id"] != second["id"]
+    assert first["ref"] == second["ref"]        # identical refs: the trap
+    library.remove(first["id"])
+    left = library.list_items()
+    assert [i["id"] for i in left] == [second["id"]]
+
+
+def test_removing_the_older_of_two_decks_leaves_the_newer_one():
+    # The exact field-report shape: old deck, then a new one, remove the old.
+    old = library.add_url("https://docs.google.com/presentation/d/e/OLD/pub?delayms=10000")
+    new = library.add_url("https://docs.google.com/presentation/d/e/NEW/pub?delayms=10000")
+    library.remove(old["id"])
+    left = library.list_items()
+    assert len(left) == 1
+    assert left[0]["id"] == new["id"]
+    assert "NEW" in left[0]["ref"]
+
+
+def test_remove_after_the_list_has_been_reordered_still_takes_the_right_item():
+    # If anything keyed on position, reordering first would misdirect the remove.
+    a = library.add_url("https://example.com/a")
+    b = library.add_url("https://example.com/b")
+    c = library.add_url("https://example.com/c")
+    library.reorder([c["id"], a["id"], b["id"]])
+    library.remove(a["id"])
+    assert [i["id"] for i in library.list_items()] == [c["id"], b["id"]]
+
+
+def test_a_measurement_finishing_late_cannot_undo_a_removal(monkeypatch):
+    # The stale-snapshot class of bug: a deck is measured while the operator edits
+    # the list. The slow step must not write back a pre-edit copy of the playlist.
+    old = library.add_url(SLIDES)
+    new = library.add_url("https://docs.google.com/presentation/d/e/NEW/pub?delayms=10000")
+
+    def slow_measure(url):
+        library.remove(old["id"])     # the operator removes the old one mid-measure
+        return 8
+    monkeypatch.setattr(library, "_count_slides", slow_measure)
+    library.measure_slides(new["id"])
+
+    left = library.list_items()
+    assert [i["id"] for i in left] == [new["id"]]   # removal survived
+    assert left[0]["slides"] == 8                   # and the measurement still landed
