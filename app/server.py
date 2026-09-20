@@ -1374,7 +1374,7 @@ def _settings_drawer(cfg: dict, role: str) -> str:
         <div class="section">
           <h3>Full-screen view</h3>
           <p>Open the page a screen shows when running as a display.</p>
-          <a class="btn-ghost full" href="/screen" style="text-decoration:none">Open full-screen view</a>
+          <a class="btn-ghost full" href="/screen?preview=1" style="text-decoration:none">Open full-screen view</a>
         </div>
       </aside>
     """

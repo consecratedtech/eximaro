@@ -625,11 +625,16 @@
     });
 
     // Show the address for ~1 minute after boot, then hand the screen to content.
+    // That splash exists so someone can find a freshly booted screen on the network.
+    // Opened deliberately from the panel ("Open full-screen view") it is pointless --
+    // you are already on the panel, looking at this device -- and a full minute of
+    // splash just reads as the preview being broken. ?preview goes straight to it.
+    const isPreview = new URLSearchParams(location.search).has('preview');
     setTimeout(() => {
       bootDone = true;
       document.getElementById('boot').style.display = 'none';
       playCurrent();
-    }, 60000);
+    }, isPreview ? 0 : 60000);
 
     loadData();
     // Poll fairly briskly so pushed content and edits appear within a few seconds.
