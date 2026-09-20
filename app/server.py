@@ -44,6 +44,7 @@ from . import (
     hostname,
     identity,
     library,
+    net,
     pairing,
     promote,
     sessions,
@@ -421,6 +422,13 @@ def create_app() -> FastAPI:
             "items": items,
             "pairing_code": pairing.current_code(),
             "shuffle": shuffle,
+            # Whether the hosts this playlist needs are answering. A cross-origin
+            # iframe never reports that it failed, so without this the screen cannot
+            # tell a loaded deck from Chromium's offline error page — and paints the
+            # error page onto a public sign. Costs nothing on an all-local playlist:
+            # no remote hosts means no lookup at all.
+            "content_reachable": net.can_reach_all(
+                [i.get("src", "") for i in items if i.get("type") == "url"]),
             # Shown ONLY on the boot splash (never over playing content): a failed
             # update should be visible to whoever walks past a rebooted screen.
             "update_alert": updater.alert(),

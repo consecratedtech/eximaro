@@ -123,3 +123,45 @@ def test_version_stamp_is_read_written_and_degrades_safely():
         if stamp.exists():
             stamp.unlink()
         importlib.reload(cfg)
+
+
+# --- reachability: a sign must never show a browser error page ----------------
+
+def test_needs_net_classification_and_caching(monkeypatch):
+    from app import net
+    net.reset_cache()
+    assert net.host_of("https://docs.google.com/presentation/d/e/X/embed") == "docs.google.com"
+    assert net.host_of("/asset/abc.png") == ""          # served by this device
+    assert net.host_of(None) == ""
+
+    calls = []
+    monkeypatch.setattr(net, "_resolves", lambda h: (calls.append(h), False)[1])
+    assert net.reachable("docs.google.com") is False
+    assert net.reachable("docs.google.com") is False    # cached, not looked up twice
+    assert calls == ["docs.google.com"]
+
+    # a purely local playlist must never trigger a lookup at all
+    calls.clear()
+    assert net.can_reach_all(["/asset/a.png", "/asset/b.mp4"]) is True
+    assert calls == []
+
+
+def test_unreachable_host_makes_a_mixed_playlist_report_false(monkeypatch):
+    from app import net
+    net.reset_cache()
+    monkeypatch.setattr(net, "_resolves", lambda h: False)
+    assert net.can_reach_all(["/asset/a.png", "https://docs.google.com/x"]) is False
+    net.reset_cache()
+    monkeypatch.setattr(net, "_resolves", lambda h: True)
+    assert net.can_reach_all(["https://docs.google.com/x"]) is True
+
+
+def test_cache_expires_so_a_recovered_network_is_noticed(monkeypatch):
+    # A screen that went offline must come back on its own when the network
+    # returns — a cached "unreachable" verdict can never be trusted forever.
+    from app import net
+    net.reset_cache()
+    monkeypatch.setattr(net, "_resolves", lambda h: True)   # the network is back
+    net._cache["h"] = (0.0, False)                          # stale "offline" verdict
+    assert net.reachable("h", now=1.0) is False             # still inside the cache window
+    assert net.reachable("h", now=net.CACHE_SECONDS + 1) is True   # expired -> re-checked

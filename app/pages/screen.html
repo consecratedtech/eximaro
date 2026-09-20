@@ -94,6 +94,13 @@
   #boot .big{font-family:"Sora",sans-serif;font-weight:600;letter-spacing:-.01em;
         font-size:clamp(20px,2.8vw,30px);color:var(--d-ink,#EDEFF1);margin-bottom:6px}
   #boot .hint{font-size:clamp(13px,1.6vw,18px);color:var(--d-muted,#9AA1A9)}
+  /* Shown instead of an item we cannot reach yet. The alternative is Chromium's
+     offline error page on a public wall, which is never acceptable on a sign. */
+  #netwait{position:fixed;inset:0;display:none;align-items:center;justify-content:center;
+        background:var(--d-bg,#101214);color:var(--d-muted,#9AA1A9);text-align:center;padding:24px;z-index:7}
+  #netwait .big{font-family:"Sora",sans-serif;font-weight:600;letter-spacing:-.01em;
+        font-size:clamp(20px,2.8vw,30px);color:var(--d-ink,#EDEFF1);margin-bottom:6px}
+  #netwait .hint{font-size:clamp(13px,1.6vw,18px);color:var(--d-muted,#9AA1A9)}
 </style>
 </head>
 <body>
@@ -114,6 +121,13 @@
     <div class="code" id="pairCode"></div>
     <img id="qrPair" class="qr" alt="QR code that opens this device">
     <div class="sub">This code disappears in a few minutes. &middot; This screen: <span class="url" id="pairUrl"></span></div>
+  </div>
+  <div id="netwait">
+    <div class="wm">e<span class="x">x</span>imaro</div>
+    <div>
+      <div class="big">Waiting for the network&hellip;</div>
+      <div class="hint">This screen starts as soon as it can reach your content.</div>
+    </div>
   </div>
   <div id="boot">
     <div class="wm">e<span class="x">x</span>imaro</div>
@@ -154,6 +168,10 @@
   <script>
     const stage = document.getElementById('stage');
     const idle = document.getElementById('idle');
+    const netwait = document.getElementById('netwait');
+    // Assume reachable until a poll says otherwise, so a server without the field
+    // (an older release) behaves exactly as it did before.
+    let contentReachable = true;
     const pair = document.getElementById('pair');
     const pairCode = document.getElementById('pairCode');
 
@@ -260,6 +278,10 @@
           pair.style.display = 'none';
         }
 
+        // Can this device actually reach the hosts its playlist needs? Absent on an
+        // older server, so treat a missing field as "yes" and behave as before.
+        contentReachable = data.content_reachable !== false;
+
         const sig = JSON.stringify({ i: data.items || [], s: !!data.shuffle });
         if (sig !== signature) {
           signature = sig;
@@ -355,6 +377,15 @@
         }
       });
     }
+    // Does showing this item require the internet? Uploads (images, pptx slideshows,
+    // uploaded video) are served by this device and always playable; links, Google
+    // Slides, YouTube and a remote video URL are not.
+    function needsNet(it) {
+      if (!it) return false;
+      if (it.type === 'url') return true;
+      if (it.type === 'video') return /^https?:/i.test(it.src || '');
+      return false;
+    }
     function revealLayer(idx) {
       layers.forEach((e, n) => e.el.classList.toggle('active', n === idx));
     }
@@ -378,6 +409,20 @@
       const idx = order[pos % order.length];
       const item = items[idx];
       const single = items.length === 1;
+      // Never put a browser error page on a sign. An item fetched over the internet
+      // cannot be shown before its host answers, and a cross-origin iframe reports a
+      // FAILED load exactly like a successful one — so revealing it on load is how
+      // Chromium's offline dinosaur ends up on the wall and stays there. On a Wi-Fi
+      // device this is routine at boot: the radio associates after the app is already
+      // up. Prefer content we can actually show; otherwise wait and retry.
+      if (needsNet(item) && !contentReachable) {
+        if (items.some(it => !needsNet(it))) { advance(); return; }   // a local item exists
+        netwait.style.display = 'flex';
+        layers.forEach(e => e.el.classList.remove('active'));
+        cycleTimer = setTimeout(playCurrent, 4000);                   // cleared by clearTimers
+        return;
+      }
+      netwait.style.display = 'none';
       if (item.type === 'slideshow') {
         playSlideshow(idx, single);
       } else if (item.type === 'video') {
