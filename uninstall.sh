@@ -69,6 +69,11 @@ rm -rf "$APP_HOME" "$RELEASES"
 echo "==> deleting the cursor set (/usr/share/${APP})"
 rm -rf "/usr/share/${APP}"
 
+# The Chromium cookie policy the kiosk ran with (it let Google Slides keep its
+# cookies). Both package spellings, since the uninstaller does not probe apt.
+echo "==> deleting the kiosk cookie policy"
+rm -f "/etc/chromium/policies/managed/${APP}.json" "/etc/chromium-browser/policies/managed/${APP}.json"
+
 if [ "$KEEP_DATA" -eq 1 ]; then
   echo "==> keeping ${DATA_DIR}"
 else

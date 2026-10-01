@@ -173,7 +173,7 @@ echo "(role is switchable later in settings; switching to controller will fetch 
 # ---- packages ---------------------------------------------------------------
 step "Installing system packages"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
+apt-get -o DPkg::Lock::Timeout=300 update -qq
 
 # common to both roles
 COMMON_PKGS="python3 python3-venv python3-dev python3-pip \
@@ -191,7 +191,7 @@ PKGS="$COMMON_PKGS"
 [ "$ROLE" = "controller" ] && PKGS="$PKGS $CONTROLLER_PKGS"
 
 # shellcheck disable=SC2086
-apt-get install -y --no-install-recommends $PKGS
+apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends $PKGS
 ok "system packages installed"
 
 # ---- app user + dirs --------------------------------------------------------
@@ -767,6 +767,50 @@ WantedBy=multi-user.target
 EOF
 ok "${APP}-kiosk.service installed (cage + ${CHROMIUM_PKG}, boots straight to fullscreen)"
 
+# ---- let embedded content keep its cookies ----------------------------------
+# The kiosk runs Chromium in --incognito (nothing persists across boots, by
+# design), and incognito blocks THIRD-PARTY cookies. A Google Slides deck on the
+# screen is exactly that: Google, framed inside our localhost page. When the embed
+# finds it cannot set a cookie, Google paints its own "Allow cookies" interstitial
+# over the deck and waits for a click that never comes on a sign. Seen twice on
+# customer screens. Intermittent because Google serves the prompt on some sessions
+# only, and the deck is re-mounted at slide 1 every cycle, so each cycle is a
+# fresh roll of the dice.
+#
+# A managed policy is the right lever: it applies in incognito too, so nothing
+# starts persisting; it says what we mean instead of leaning on a Chromium default
+# that could change under us; and it survives flag edits. It goes in the policy
+# directory of the chromium package actually installed - this binary reads exactly
+# /etc/chromium/policies (checked with strings on trixie), so guessing at both
+# package spellings is unnecessary. Auto-clicking the button from screen.html is
+# not an option: the frame is cross-origin and the page cannot reach into it.
+step "Letting embedded content (Google Slides, YouTube) keep its cookies"
+POLICY_DIR="/etc/${CHROMIUM_PKG:-chromium}/policies/managed"
+install -d -m 0755 "$POLICY_DIR"
+_pol="${POLICY_DIR}/${APP}.json"
+cat > "${_pol}.new" <<'EOF'
+{
+  "BlockThirdPartyCookies": false,
+  "DefaultCookiesSetting": 1,
+  "CookiesAllowedForUrls": [
+    "https://[*.]google.com",
+    "https://[*.]youtube.com",
+    "https://[*.]googleusercontent.com",
+    "https://[*.]gstatic.com"
+  ]
+}
+EOF
+# Prove it before claiming it: a policy file Chromium cannot parse is silently
+# ignored, which would bring the banner straight back with no error anywhere.
+if python3 -m json.tool "${_pol}.new" >/dev/null 2>&1; then
+  chmod 0644 "${_pol}.new" && mv -f "${_pol}.new" "$_pol"
+  ok "cookie policy installed (${_pol})"
+else
+  rm -f "${_pol}.new"
+  warn "cookie policy did not validate as JSON and was NOT installed - a Google"
+  warn "'Allow cookies' banner can appear over a Slides deck until this is fixed"
+fi
+
 # The installer is the SOLE owner of the kiosk unit. Wipe any override drop-ins:
 # they only ever come from an earlier field hotfix (e.g. a hand-added
 # --user-data-dir or --autoplay-policy), and the base unit above already carries
@@ -795,7 +839,7 @@ REQ="\${DATA_DIR}/promote.request"
 status(){ rm -f "\$STATUS" 2>/dev/null; printf '{"state":"%s","detail":"%s","when":"%s"}\n' "\$1" "\$2" "\$(date -Is)" >"\$STATUS"; chown -h ${APP_USER}:${APP_USER} "\$STATUS" 2>/dev/null || true; }
 status running "installing PowerPoint conversion packages"
 export DEBIAN_FRONTEND=noninteractive
-if apt-get update -qq && apt-get install -y --no-install-recommends ${CONTROLLER_PKGS}; then
+if apt-get -o DPkg::Lock::Timeout=300 update -qq && apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends ${CONTROLLER_PKGS}; then
   status done "PowerPoint conversion is ready"
 else
   status failed "package install failed (the device needs internet to add PowerPoint support)"

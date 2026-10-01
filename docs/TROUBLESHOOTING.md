@@ -85,6 +85,7 @@ Look at the very start of the output:
 - ⚠️ **`"items":[]`** (empty) — nothing to play. Either the playlist is empty (add content in the panel), or every item is **targeted at other displays** (in the panel's Content page, set the items to **all screens**). On a **controller**, make sure **Settings → "Show content on this screen"** is checked.
 - ⚠️ **`"pairing_code":"ABCD"`** (not null) — the device is a **display waiting to be paired**. Enter that code on the controller's panel to link it.
 - ⚠️ **`"wifi_setup":{…}`** — the device has no working network and is showing its Wi‑Fi setup screen → section 5.
+- ⚠️ **The TV shows a Google "Allow cookies" button over a Slides deck** — that is Google's own prompt inside the embed, not Eximaro, and it means the device is on a version from before the cookie policy was added. Run the full update (`sudo eximaro-update-full`): it installs a Chromium policy that lets embedded Google content keep its cookies, and the prompt can no longer appear.
 
 ---
 
