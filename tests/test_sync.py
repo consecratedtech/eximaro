@@ -233,3 +233,49 @@ def test_clear_received_removes_playlist_and_assets(clean_data_dir):
     sync.clear_received()
     assert sync.screen_items() is None
     assert not (sync.RECV_ASSETS / "a.img").exists()
+
+
+# --- a push follows a display that moved, and says what went wrong -------------
+
+def _displays():
+    return [{"device_id": "aaaa1111", "name": "lobby", "address": "10.0.0.5", "port": 8080}]
+
+
+def test_push_rediscovers_a_moved_display_and_remembers_it(monkeypatch):
+    from app import sync
+    attempts = []
+    def fake_push(displays, *a, **k):
+        attempts.append([(d["address"], d["port"]) for d in displays])
+        return [{"name": d["name"], "ok": d["address"] == "10.0.0.9", "error": "<urlopen error [Errno 111] Connection refused>"}
+                for d in displays]
+    monkeypatch.setattr(sync, "push_targeted", fake_push)
+    remembered = []
+    res = sync.push_with_rediscovery(_displays(), [], "ctl", "http://c", "k",
+                                     browse=lambda t: [{"device_id": "aaaa1111", "address": "10.0.0.9", "port": 8080}],
+                                     update=remembered.append)
+    assert attempts == [[("10.0.0.5", 8080)], [("10.0.0.9", 8080)]]   # retried at the new address
+    assert res[0]["ok"] is True
+    assert remembered and remembered[0]["address"] == "10.0.0.9"        # saved for next time
+
+
+def test_push_reports_a_plain_error_when_the_display_is_really_gone(monkeypatch):
+    from app import sync
+    monkeypatch.setattr(sync, "push_targeted", lambda displays, *a, **k: [
+        {"name": d["name"], "ok": False, "error": "<urlopen error timed out>"} for d in displays])
+    res = sync.push_with_rediscovery(_displays(), [], "ctl", "http://c", "k", browse=lambda t: [], update=lambda d: None)
+    assert res[0]["ok"] is False
+    assert "could not reach the screen at 10.0.0.5:8080" in res[0]["error"]
+
+
+def test_push_does_not_browse_the_lan_when_nothing_failed(monkeypatch):
+    from app import sync
+    monkeypatch.setattr(sync, "push_targeted", lambda displays, *a, **k: [{"name": d["name"], "ok": True} for d in displays])
+    def never(t): raise AssertionError("browse must not run on a clean push")
+    res = sync.push_with_rediscovery(_displays(), [], "ctl", "http://c", "k", browse=never, update=None)
+    assert res[0]["ok"] is True
+
+
+def test_plain_error_distinguishes_rejection_from_absence():
+    from app import sync
+    assert "no longer paired" in sync.plain_error("HTTP Error 403: Forbidden", "10.0.0.5", 8080)
+    assert "client isolation" in sync.plain_error("<urlopen error [Errno 113] No route to host>", "10.0.0.5", 8080)

@@ -88,10 +88,11 @@ def create_app() -> FastAPI:
         if not displays:
             return []
         base_url = f"http://{discovery.primary_ip()}:{config.PORT}"
-        return sync.push_targeted(
+        return sync.push_with_rediscovery(
             displays, library.list_items(), current()["name"],
             base_url, auth.get_or_create_site_key(),
             shuffle=bool(current().get("shuffle")),
+            browse=discovery.browse, update=pairing.add_display_record,
         )
 
     def _autopush(background: BackgroundTasks) -> None:
@@ -105,9 +106,12 @@ def create_app() -> FastAPI:
         """Read the length of any Google Slides deck we couldn't size yet, then push
         again if anything changed. Kept off the request path so 'Push' returns fast
         instead of blocking on a headless browser."""
+        # Only decks that are due: each attempt is an anonymous load of the deck, which
+        # is exactly the traffic Google throttles with a sign-in page. A deck it is
+        # refusing must not be hammered on every Push (see library.MEASURE_RETRY).
         changed = False
         for it in library.list_items():
-            if it["type"] == "url" and not it.get("slides") and library._is_google_slides(it.get("ref", "")):
+            if library.due_for_measure(it):
                 library.measure_slides(it["id"])
                 changed = True
         if changed:
@@ -427,7 +431,11 @@ def create_app() -> FastAPI:
             # tell a loaded deck from Chromium's offline error page — and paints the
             # error page onto a public sign. Costs nothing on an all-local playlist:
             # no remote hosts means no lookup at all.
-            "content_reachable": net.can_reach_all(
+            "content_reachable": not net.first_problem(
+                [i.get("src", "") for i in items if i.get("type") == "url"]),
+            # The reason, when there is one, so the waiting card can say "Google is
+            # asking viewers to sign in" rather than blaming the network.
+            "content_note": net.first_problem(
                 [i.get("src", "") for i in items if i.get("type") == "url"]),
             # Shown ONLY on the boot splash (never over playing content): a failed
             # update should be visible to whoever walks past a rebooted screen.
@@ -1759,8 +1767,16 @@ def _content_body(cfg: dict, displays=None) -> str:
                 # seconds box stays, so nobody is ever stuck waiting.
                 secs_html = secs_form.replace("{title}", "Or set the seconds by hand")
             elif is_slides_raw:
-                note = ('<span class="slidenote">&#9654; Google Slides &mdash; haven\'t read its '
-                        'length yet; re-check while online, or set the seconds by hand</span>')
+                # If Google is refusing anonymous viewers, say so — that is the actual
+                # reason the length could not be read, and nothing on the device fixes it.
+                _ok, _why = net.probe(it.get("ref", ""))
+                if not _ok and "sign in" in _why:
+                    note = (f'<span class="slidenote">&#9654; Google Slides &mdash; {_esc(_why)}. '
+                            'Check File &rarr; Share &rarr; Publish to web, and that your Google '
+                            'account allows publishing to anyone</span>')
+                else:
+                    note = ('<span class="slidenote">&#9654; Google Slides &mdash; haven\'t read its '
+                            'length yet; re-check while online, or set the seconds by hand</span>')
                 secs_html = (f"""
                 <form class="secs" method="post" action="/api/content/remeasure"
                       title="Read the deck length now (needs to be online)">
@@ -2011,7 +2027,7 @@ def _push_card() -> str:
           if(d.message){{box.textContent=d.message;return;}}
           const ok=d.results.filter(x=>x.ok).length;
           const fail=d.results.filter(x=>!x.ok);
-          box.textContent=`Sent to ${{ok}} display(s).`+(fail.length?` Failed: ${{fail.map(f=>f.name).join(', ')}}.`:'');
+          box.textContent=`Sent to ${{ok}} display(s).`+(fail.length?` Failed: ${{fail.map(f=>f.name+(f.error?' — '+f.error:'')).join('; ')}}.`:'');
         }}catch(e){{box.textContent='Push failed.';}}
         finally{{if(btn) btn.disabled=false;}}
       }}

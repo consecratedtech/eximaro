@@ -249,6 +249,14 @@ def add_video_path(filename: str, src_path) -> dict:
 # that was killed (a reboot mid-measure, say) can't leave a row spinning for ever.
 MEASURE_GRACE = 150
 
+# How long to leave a deck alone after a measurement attempt before trying again on
+# its own. Every attempt is an anonymous load of the deck from Google, and Google
+# throttles anonymous views of a popular document by serving a sign-in page instead
+# of the deck. Re-measuring an unmeasured deck on EVERY Push fed that throttle — and
+# a deck Google was refusing never measured, so it was retried on every single Push,
+# forever. One try an hour is plenty; the Re-check button is there for a human.
+MEASURE_RETRY = 3600
+
 
 def measuring(item: dict) -> bool:
     """Is this item's automatic timing still being read? False once the attempt has
@@ -257,6 +265,20 @@ def measuring(item: dict) -> bool:
     if not isinstance(started, int):
         return False
     return 0 <= (int(time.time()) - started) <= MEASURE_GRACE
+
+
+def due_for_measure(item: dict, now: float = None) -> bool:
+    """Should the background re-measure try this item? Only a Google Slides deck
+    with no slide count yet, and only if it hasn't been tried within MEASURE_RETRY."""
+    if item.get("type") != "url" or item.get("slides"):
+        return False
+    if not _is_google_slides(item.get("ref", "")):
+        return False
+    tried = item.get("measure_tried")
+    if not isinstance(tried, int):
+        return True
+    now = time.time() if now is None else now
+    return (now - tried) >= MEASURE_RETRY
 
 
 def measure_slides(item_id: str) -> dict:
@@ -285,6 +307,7 @@ def measure_slides(item_id: str) -> dict:
         # and offers the manual re-check instead, rather than waiting on a result
         # that is never coming.
         it.pop("measuring", None)
+        it["measure_tried"] = int(time.time())   # success or not, this attempt counts
         if n and per:
             it["slides"] = n
             it["per_slide"] = per

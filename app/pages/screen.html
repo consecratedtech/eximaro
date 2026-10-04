@@ -125,8 +125,8 @@
   <div id="netwait">
     <div class="wm">e<span class="x">x</span>imaro</div>
     <div>
-      <div class="big">Waiting for the network&hellip;</div>
-      <div class="hint">This screen starts as soon as it can reach your content.</div>
+      <div class="big">Waiting for content&hellip;</div>
+      <div class="hint" id="netwaitWhy">This screen starts as soon as it can reach your content.</div>
     </div>
   </div>
   <div id="boot">
@@ -183,6 +183,7 @@
     let lastUrl = '';      // current connect URL (so the QR refreshes if the IP changes)
     let bootId = '';       // app-start token; when it changes the page reloads itself
     let bootDone = false;  // true after the startup address splash has elapsed
+    const LONE_DECK_REMOUNT_MS = 15 * 60 * 1000;  // how long a bad load can last on a one-deck playlist
     let layers = [];       // mounted layer per item (built once, reused)
 
     let cycleTimer = null;   // advances items, and slides WITHIN a pptx slideshow
@@ -281,6 +282,12 @@
         // Can this device actually reach the hosts its playlist needs? Absent on an
         // older server, so treat a missing field as "yes" and behave as before.
         contentReachable = data.content_reachable !== false;
+        // The server says WHY when it can't be shown ("no network yet", or Google asking
+        // viewers to sign in). Show that, so a sign-in wall is never misread as wifi.
+        const why = document.getElementById('netwaitWhy');
+        if (why) why.textContent = data.content_note
+          ? ('Not showing it yet: ' + data.content_note + '. Retrying.')
+          : 'This screen starts as soon as it can reach your content.';
 
         const sig = JSON.stringify({ i: data.items || [], s: !!data.shuffle });
         if (sig !== signature) {
@@ -472,6 +479,13 @@
         clearPendingSlide();
         revealLayer(idx);
         if (!single) cycleTimer = setTimeout(advance, dur(entry.item));
+        // A lone deck used to load exactly once and never again, so whatever Google
+        // served at that instant — including its intermittent sign-in wall — stayed on
+        // the screen until someone restarted the kiosk. The frame is cross-origin, so
+        // the page cannot see what is in it; the only honest remedy is to re-mount on
+        // a timer. Going through playCurrent re-checks reachability first, so a deck
+        // Google is currently refusing is held on the waiting card instead.
+        else cycleTimer = setTimeout(playCurrent, LONE_DECK_REMOUNT_MS);
       };
       iframe.onload = go;
       iframe.src = entry.src;                       // reassigning src restarts at slide 1

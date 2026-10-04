@@ -601,3 +601,24 @@ def test_a_measurement_finishing_late_cannot_undo_a_removal(monkeypatch):
     left = library.list_items()
     assert [i["id"] for i in left] == [new["id"]]   # removal survived
     assert left[0]["slides"] == 8                   # and the measurement still landed
+
+
+# --- re-measure throttling: never hammer a deck on every Push -----------------
+
+def test_due_for_measure_only_when_unmeasured_and_not_recently_tried():
+    import time as _t
+    now = int(_t.time())
+    deck = {"type": "url", "ref": SLIDES}
+    assert library.due_for_measure(deck, now) is True                      # never tried
+    assert library.due_for_measure(dict(deck, measure_tried=now - 60), now) is False
+    assert library.due_for_measure(dict(deck, measure_tried=now - library.MEASURE_RETRY - 1), now) is True
+    assert library.due_for_measure(dict(deck, slides=8), now) is False     # already measured
+    assert library.due_for_measure({"type": "url", "ref": "https://example.com"}, now) is False
+
+
+def test_a_failed_measurement_is_stamped_so_it_is_not_retried_at_once(monkeypatch):
+    item = library.add_url(SLIDES)
+    monkeypatch.setattr(library, "_count_slides", lambda url: 0)   # Google refused it
+    out = library.measure_slides(item["id"])
+    assert isinstance(out.get("measure_tried"), int)
+    assert library.due_for_measure(out) is False                   # not again for an hour

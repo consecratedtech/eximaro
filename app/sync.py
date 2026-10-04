@@ -146,6 +146,59 @@ def push_targeted(displays: list, items: list, from_name: str, base_url: str, si
         return list(pool.map(_one, displays))
 
 
+def plain_error(exc_text: str, address: str, port) -> str:
+    """A push error an operator can act on, instead of a Python exception string."""
+    t = (exc_text or "").lower()
+    if "http error 403" in t or "http error 401" in t:
+        return (f"the screen at {address} refused the push: it is no longer paired to this "
+                f"controller. Pair it again from the Screens page")
+    if "http error" in t:
+        return f"the screen at {address} answered an error ({exc_text})"
+    # No answer at all. The address is the one the screen had when it was paired — if
+    # it still has it, the two devices are on the same network but can't talk to each
+    # other, which is what guest Wi-Fi "client isolation" does.
+    return (f"could not reach the screen at {address}:{port}. It may be off, or this "
+            f"network may be stopping devices from talking to each other (client isolation "
+            f"on guest Wi-Fi) — try putting both on the same wired or non-guest network")
+
+
+def push_with_rediscovery(displays: list, items: list, from_name: str, base_url: str,
+                          site_key: str, shuffle: bool = False, browse=None, update=None) -> list:
+    """push_targeted, plus the thing an operator should never have to do by hand:
+    a display's address is captured when it is paired and DHCP can move it any time.
+    When a push can't reach a display, look for it on the LAN by its device id; if it
+    is there on a different address, remember the new one and push again. Only runs
+    the (3-second) LAN browse when something actually failed. Every result carries a
+    plain-language 'error' so the panel can say what went wrong, not just who."""
+    results = push_targeted(displays, items, from_name, base_url, site_key, shuffle)
+    by_id = {d["device_id"]: d for d in displays}
+    failed = [d for d, r in zip(displays, results) if not r.get("ok")]
+    if failed and browse is not None:
+        try:
+            seen = {f["device_id"]: f for f in browse(3.0) if f.get("device_id")}
+        except Exception:
+            seen = {}
+        moved = []
+        for d in failed:
+            f = seen.get(d["device_id"])
+            if f and f.get("address") and (f["address"], f.get("port")) != (d.get("address"), d.get("port")):
+                nd = dict(d, address=f["address"], port=f.get("port") or d.get("port"))
+                moved.append(nd)
+                if update is not None:
+                    update(nd)                 # remember where it lives now
+        if moved:
+            retry = push_targeted(moved, items, from_name, base_url, site_key, shuffle)
+            fixed = {m["device_id"]: r for m, r in zip(moved, retry)}
+            results = [fixed.get(d["device_id"], r) for d, r in zip(displays, results)]
+            for m in moved:
+                by_id[m["device_id"]] = m
+    for d, r in zip(displays, results):
+        if not r.get("ok"):
+            cur = by_id[d["device_id"]]
+            r["error"] = plain_error(r.get("error", ""), cur.get("address", "?"), cur.get("port", "?"))
+    return results
+
+
 # --- display side -----------------------------------------------------------
 
 def _save(playlist: dict) -> None:

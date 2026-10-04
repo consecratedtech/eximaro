@@ -165,3 +165,51 @@ def test_cache_expires_so_a_recovered_network_is_noticed(monkeypatch):
     net._cache["h"] = (0.0, False)                          # stale "offline" verdict
     assert net.reachable("h", now=1.0) is False             # still inside the cache window
     assert net.reachable("h", now=net.CACHE_SECONDS + 1) is True   # expired -> re-checked
+
+
+# --- Google refusing a deck is visible to the server --------------------------
+
+def test_probe_reads_googles_answer(monkeypatch):
+    from app import net
+    net.reset_cache()
+    deck = "https://docs.google.com/presentation/d/e/2PACX-x/embed?start=true"
+    monkeypatch.setattr(net, "_fetch", lambda u: (u, 200))
+    assert net.probe(deck) == (True, "")
+    net.reset_cache()
+    monkeypatch.setattr(net, "_fetch", lambda u: (u, 401))
+    ok, why = net.probe(deck)
+    assert ok is False and "sign in" in why
+    net.reset_cache()
+    monkeypatch.setattr(net, "_fetch", lambda u: ("https://accounts.google.com/ServiceLogin?x", 200))
+    ok, why = net.probe(deck)
+    assert ok is False and "sign in" in why
+    net.reset_cache()
+    def boom(u): raise TimeoutError()
+    monkeypatch.setattr(net, "_fetch", boom)
+    ok, why = net.probe(deck)
+    assert ok is False and "could not reach" in why
+
+
+def test_probe_is_cached_so_it_cannot_become_a_load_source(monkeypatch):
+    from app import net
+    net.reset_cache()
+    calls = []
+    monkeypatch.setattr(net, "_fetch", lambda u: (calls.append(u), (u, 200))[1])
+    deck = "https://docs.google.com/presentation/d/e/2PACX-y/embed"
+    for _ in range(50):
+        net.probe(deck, now=1000.0)
+    assert len(calls) == 1
+    net.probe(deck, now=1000.0 + net.PROBE_CACHE_SECONDS + 1)
+    assert len(calls) == 2
+
+
+def test_first_problem_explains_the_screen_and_stays_silent_when_local(monkeypatch):
+    from app import net
+    net.reset_cache()
+    monkeypatch.setattr(net, "_resolves", lambda h: True)
+    monkeypatch.setattr(net, "_fetch", lambda u: (u, 401))
+    assert "sign in" in net.first_problem(["https://docs.google.com/presentation/d/e/2PACX-z/embed"])
+    assert net.first_problem(["/asset/a.png"]) == ""
+    net.reset_cache()
+    monkeypatch.setattr(net, "_resolves", lambda h: False)
+    assert net.first_problem(["https://docs.google.com/presentation/d/e/2PACX-z/embed"]) == "no network yet"
