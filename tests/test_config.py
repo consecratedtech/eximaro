@@ -213,3 +213,50 @@ def test_first_problem_explains_the_screen_and_stays_silent_when_local(monkeypat
     net.reset_cache()
     monkeypatch.setattr(net, "_resolves", lambda h: False)
     assert net.first_problem(["https://docs.google.com/presentation/d/e/2PACX-z/embed"]) == "no network yet"
+
+
+# --- retry discipline: try ~2 minutes, then stay quiet 15, then try again ---------
+
+def test_a_failing_host_goes_quiet_after_the_active_window(monkeypatch):
+    from app import net
+    net.reset_cache()
+    calls = []
+    monkeypatch.setattr(net, "_resolves", lambda h: (calls.append(h), False)[1])
+    t0 = 1000.0
+    # keep asking every 20s (the DNS cache length) across the active window
+    for s in range(0, net.ACTIVE_WINDOW + 1, net.CACHE_SECONDS):
+        net.reachable("deck.example", now=t0 + s)
+    active_calls = len(calls)
+    assert active_calls >= 2                                   # it did try
+    assert net.quiet_for("deck.example", now=t0 + net.ACTIVE_WINDOW + 1) > 0
+    # during the quiet period nothing leaves the device, however often the screen asks
+    for s in range(1, net.QUIET_PERIOD, 20):
+        assert net.reachable("deck.example", now=t0 + net.ACTIVE_WINDOW + s) is False
+    assert len(calls) == active_calls
+    # after the quiet period it tries again
+    net.reachable("deck.example", now=t0 + net.ACTIVE_WINDOW + net.QUIET_PERIOD + 1)
+    assert len(calls) == active_calls + 1
+
+
+def test_a_success_ends_any_quiet_period(monkeypatch):
+    from app import net
+    net.reset_cache()
+    net._quiet["h"] = 5000.0
+    monkeypatch.setattr(net, "_resolves", lambda h: True)
+    assert net.reachable("h", now=6000.0) is True
+    assert net.quiet_for("h", now=6000.0) == 0
+
+
+def test_google_probe_respects_the_quiet_period_too(monkeypatch):
+    from app import net
+    net.reset_cache()
+    calls = []
+    monkeypatch.setattr(net, "_fetch", lambda u: (calls.append(u), (u, 401))[1])
+    deck = "https://docs.google.com/presentation/d/e/2PACX-q/embed"
+    net.probe(deck, now=0.0)                              # fails -> failure run starts
+    net.probe(deck, now=net.PROBE_CACHE_SECONDS + 1)      # second real attempt, still failing
+    assert len(calls) == 2
+    assert net.quiet_for(deck, now=net.PROBE_CACHE_SECONDS + 2) > 0
+    ok, why = net.probe(deck, now=net.PROBE_CACHE_SECONDS + 2)
+    assert ok is False and "sign in" in why               # the last reason is still shown
+    assert len(calls) == 2                                # and Google was not asked again

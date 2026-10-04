@@ -29,6 +29,39 @@ RESOLVE_TIMEOUT = 2.0
 
 _cache: dict = {}        # host -> (checked_at, reachable)
 
+# Retry discipline for anything that fails. A screen that cannot reach its content
+# must not keep knocking: it tries for ACTIVE_WINDOW, then goes QUIET_PERIOD without
+# sending a single packet for that target, then tries again. Everything the screen
+# does in between is local. This is the owner's rule for a sign on someone else's
+# network, and it also keeps a device from feeding Google's throttle.
+ACTIVE_WINDOW = 120
+QUIET_PERIOD = 900
+_failing: dict = {}      # key -> first failure time in the current run of failures
+_quiet: dict = {}        # key -> time until which the key is not checked at all
+
+
+def _gate(key: str, now: float):
+    """True when `key` is in a quiet period and must not touch the network."""
+    return now < _quiet.get(key, 0)
+
+
+def _record(key: str, ok: bool, now: float) -> None:
+    """Track a run of failures; once it has lasted ACTIVE_WINDOW, go quiet."""
+    if ok:
+        _failing.pop(key, None)
+        _quiet.pop(key, None)
+        return
+    first = _failing.setdefault(key, now)
+    if now - first >= ACTIVE_WINDOW:
+        _quiet[key] = now + QUIET_PERIOD
+        _failing.pop(key, None)
+
+
+def quiet_for(key: str, now: float = None) -> float:
+    """Seconds left in a quiet period for this host/url, 0 if it is being checked."""
+    now = time.time() if now is None else now
+    return max(0.0, _quiet.get(key, 0) - now)
+
 # A Google Slides deck can be *unreachable in a way DNS cannot see*: Google throttles
 # anonymous views of a busy published document by answering 401, or redirecting to a
 # sign-in page, instead of the deck — and it does so intermittently. Framed in the
@@ -75,6 +108,9 @@ def probe(url: str, now: float = None):
     """(ok, reason) for a Google Slides deck: is Google serving it to an anonymous
     viewer right now? Cached; a failed network fetch reads as not-ok with a reason."""
     now = time.time() if now is None else now
+    if _gate(url, now):
+        hit = _probe_cache.get(url)
+        return False, (hit[2] if hit else "not checked again yet")
     hit = _probe_cache.get(url)
     if hit and (now - hit[0]) < PROBE_CACHE_SECONDS:
         return hit[1], hit[2]
@@ -83,6 +119,7 @@ def probe(url: str, now: float = None):
     except Exception as exc:          # DNS down, timeout, connection refused
         ok, reason = False, f"could not reach Google ({type(exc).__name__})"
     _probe_cache[url] = (now, ok, reason)
+    _record(url, ok, now)
     return ok, reason
 
 
@@ -112,11 +149,14 @@ def reachable(host: str, now: float = None) -> bool:
     if not host:
         return True                      # local content: nothing to reach
     now = time.time() if now is None else now
+    if _gate(host, now):
+        return False                 # quiet period: no lookup, last answer stands
     hit = _cache.get(host)
     if hit and (now - hit[0]) < CACHE_SECONDS:
         return hit[1]
     ok = _resolves(host)
     _cache[host] = (now, ok)
+    _record(host, ok, now)
     return ok
 
 
@@ -148,3 +188,5 @@ def reset_cache() -> None:
     """Drop cached verdicts (tests, and after a network change)."""
     _cache.clear()
     _probe_cache.clear()
+    _failing.clear()
+    _quiet.clear()

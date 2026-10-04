@@ -488,7 +488,10 @@
         else cycleTimer = setTimeout(playCurrent, LONE_DECK_REMOUNT_MS);
       };
       iframe.onload = go;
-      iframe.src = entry.src;                       // reassigning src restarts at slide 1
+      // A fresh query value on every (re)mount, so the browser must actually ask Google
+      // again rather than hand back whatever it cached last time - including a sign-in
+      // page. Google ignores the parameter; the saved link is never changed by this.
+      iframe.src = entry.src + (entry.src.includes('?') ? '&' : '?') + 'r=' + Date.now();
       pendingSlide = { iframe, timer: setTimeout(go, 3500) };  // fail-safe if onload never fires
     }
 
