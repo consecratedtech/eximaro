@@ -31,7 +31,7 @@ cryptography==49.0.0
 zeroconf==0.150.0
 
 # --- content handling (images, conversions) ---
-pillow==12.3.0
+pillow==13.0.0
 
 # --- QR code for the on-screen "scan to open" setup helper ---
 qrcode==8.2
