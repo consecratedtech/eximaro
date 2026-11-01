@@ -166,12 +166,17 @@ def create_app() -> FastAPI:
                    # Update progress is not sensitive (like /healthz) and MUST stay
                    # readable across the mid-update restart, which wipes in-memory
                    # sessions — otherwise the update overlay's poll would hang.
-                   "/api/update-status",
-                   # WiFi setup: a phone joins the setup AP with no session, so these
-                   # stay open. They only do anything while the Pi is hosting that AP.
-                   "/wifi-setup", "/wifi-qr.png", "/wifi-open-qr.png",
-                   "/api/wifi/start", "/api/wifi/connect", "/api/wifi/stop"}
+                   "/api/update-status"}
     _OPEN_PREFIX = ("/asset/", "/recv-asset/", "/static/", "/api/pair/claim", "/api/playlist")
+    # Wi-Fi setup stays open to a phone on this device's OWN setup network: it has no
+    # session, and getting onto that network took the password shown on the TV. Reached
+    # from the normal network, these are panel pages like any other and need signing in
+    # once a password is set - otherwise anyone there could move the screen to another
+    # network, or knock it off this one.
+    _SETUP_NETWORK_OPEN = {"/wifi-setup", "/wifi-qr.png", "/wifi-open-qr.png",
+                           "/api/wifi/connect", "/api/wifi/stop"}
+    # The TV itself shows the two setup QR codes while it hosts that network.
+    _SCREEN_OPEN = {"/wifi-qr.png", "/wifi-open-qr.png"}
     _login_fails = {}  # client ip -> (count, window_start): basic brute-force throttle
 
     def _throttled(ip: str) -> bool:
@@ -213,6 +218,11 @@ def create_app() -> FastAPI:
             _ap_cache["at"] = now
         return _ap_cache["val"]
 
+    def _via_setup_network(request: Request) -> bool:
+        """Did this request arrive over the setup network this device is hosting?"""
+        client = request.client.host if request.client else ""
+        return client.startswith(discovery.AP_SUBNET) and _hosting_ap_cached()
+
     @app.middleware("http")
     async def _auth_gate(request: Request, call_next):
         # Captive-portal redirect comes first: an outside-domain request while we host
@@ -223,6 +233,10 @@ def create_app() -> FastAPI:
             return RedirectResponse(wifi.setup_page_url(), status_code=302)
         path = request.url.path
         if path in _OPEN_EXACT or any(path.startswith(p) for p in _OPEN_PREFIX):
+            return await call_next(request)
+        if path in _SETUP_NETWORK_OPEN and _via_setup_network(request):
+            return await call_next(request)
+        if path in _SCREEN_OPEN and _from_this_device(request):
             return await call_next(request)
         if not auth.has_credentials():        # no password set → open access
             return await call_next(request)
