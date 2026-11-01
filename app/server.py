@@ -2243,8 +2243,19 @@ def _wifi_move_screen(cfg: dict, ssid: str, password: str, here: str = "") -> HT
     current_ssid = wifi.status().get("ssid") if on_wifi else None
     if cable and not on_wifi:
         title, lead = f"Connect {name} to {new}?", "If you continue:"
-        bullets = ["It stays on its network cable as well, so nothing it&rsquo;s doing now stops.",
-                   f"If the name or password is wrong, it simply won&rsquo;t join {new}."]
+        displays = pairing.list_displays() if cfg.get("role") == "controller" else []
+        if displays:
+            # Once it has Wi-Fi it shows and shares its Wi-Fi address first, and that
+            # is where its displays are told to fetch pictures and videos from.
+            need = "needs" if len(displays) == 1 else "need"
+            bullets = ["It stays on its network cable as well.",
+                       f"Once it&rsquo;s on {new}, {_names(_display_names(displays))} {need} to "
+                       f"be able to reach {new} too. If they can&rsquo;t, the next change you "
+                       "send makes them drop their pictures and videos and keep only web "
+                       "links."]
+        else:
+            bullets = ["It stays on its network cable as well, so nothing it&rsquo;s doing now stops."]
+        bullets.append(f"If the name or password is wrong, it simply won&rsquo;t join {new}.")
         keep, yes, yes_class = "Cancel", f"Yes, connect to {new}", "stop"
     else:
         cur = f"<b>{_esc(current_ssid)}</b>" if current_ssid else "the network it&rsquo;s on now"

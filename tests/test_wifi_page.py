@@ -240,3 +240,14 @@ def test_the_setup_page_promises_only_what_holds(monkeypatch):
     page = TestClient(_client(role="display").app, client=PHONE, base_url=SETUP_HOST).get("/wifi-setup").text
     assert "within a minute" not in page
     assert "normally brings the setup network back" in page and "network cable" in page
+
+
+def test_a_wired_controller_warns_its_displays_may_lose_pictures(monkeypatch):
+    from app import pairing
+    _on(monkeypatch, WIRED)
+    pairing.add_display_record({"device_id": "aaaa1111", "name": "Lobby", "address": "192.0.2.8", "port": 8080})
+    page = TestClient(_client(role="controller").app, client=LAN).post(
+        "/api/wifi/connect", data={"ssid": "Office"}).text
+    assert "Lobby needs to be able to reach Office too" in page
+    assert "drop their pictures and videos" in page
+    assert "nothing it&rsquo;s doing now stops" not in page
