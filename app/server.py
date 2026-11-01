@@ -2658,7 +2658,7 @@ def _control_home(cfg: dict) -> HTMLResponse:
                 <span class="name">{_esc(d['name'] or d['device_id'][:8])}</span>
                 <span class="meta">{_esc(d['address'])}</span>
                 <form method="get" action="/displays/remove">
-                  <input type="hidden" name="device_id" value="{d['device_id']}">
+                  <input type="hidden" name="device_id" value="{_esc(d['device_id'])}">
                   <button class="x" title="Unpair&hellip;" aria-label="Unpair {_esc(d['name'] or d['device_id'][:8])}">&times;</button>
                 </form>
               </div>"""

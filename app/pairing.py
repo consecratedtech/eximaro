@@ -14,6 +14,7 @@ name or address later without breaking the paired link.
 
 import base64
 import ipaddress
+import re
 import secrets
 import time
 import urllib.request
@@ -29,6 +30,7 @@ from .crypto import VAULT_LOCK, Vault
 CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no 0/O/1/I/L to avoid misreads
 CODE_LENGTH = 8
 CODE_TTL = 180  # seconds the code stays valid (matches the on-screen timeout)
+_DEVICE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")   # ids are hex; never markup or a path
 
 # Display-side pending code, kept only in memory (never written to disk).
 _pending = {"code": None, "expires": 0.0}
@@ -206,9 +208,15 @@ def claim_display(address: str, port: int, code: str, controller: dict) -> dict:
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=10) as resp:
         result = _json.loads(resp.read().decode())
+    # Whatever answered at that address wrote this reply, so keep only an id shaped
+    # like a real one (device ids are hex) and a name that is plain text.
+    device_id = result.get("device_id")
+    if not isinstance(device_id, str) or not _DEVICE_ID.fullmatch(device_id):
+        raise ValueError("That device didn't answer like an eximaro screen.")
+    name = result.get("name")
     record = {
-        "device_id": result["device_id"],
-        "name": result.get("name", ""),
+        "device_id": device_id,
+        "name": name.strip()[:64] if isinstance(name, str) else "",
         "address": address,
         "port": port,
     }
