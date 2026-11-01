@@ -612,7 +612,7 @@ def test_screen_data_tells_the_checks_when_the_screen_was_just_switched_on(monke
     config.save_config(cfg)
     library.add_url(DECK, 30)
     seen = []
-    monkeypatch.setattr(net, "first_problem", lambda urls, **kw: (seen.append(kw.get("starting")), "")[1])
+    monkeypatch.setattr(net, "problems", lambda urls, **kw: (seen.append(kw.get("starting")), {})[1])
     client = TestClient(create_app())
     for on in (60.0, net.STARTUP_GRACE + 1, None):
         monkeypatch.setattr(server, "_seconds_since_power_on", lambda on=on: on)
@@ -672,3 +672,45 @@ def test_a_failed_update_still_says_so_on_the_screen(monkeypatch):
     monkeypatch.setattr(updater, "alert", lambda: "The update did not start; restored the previous version")
     data = client.get("/api/screen-data").json()
     assert data["startup_left"] == server.STARTUP_SCREEN and "restored" in data["update_alert"]
+
+
+def test_one_item_that_cannot_be_shown_does_not_hold_back_the_others(monkeypatch):
+    # A deck Google is refusing, or a link with a typo in its name, is skipped; a deck
+    # that Google serves still plays. Each item gets its own reason.
+    from app import net
+    net.reset_cache()
+    good = "https://docs.google.com/presentation/d/e/2PACX-good/embed"
+    refused = "https://docs.google.com/presentation/d/e/2PACX-refused/embed"
+    typo = "https://no-such-host.example/board"
+    monkeypatch.setattr(net, "_resolves", lambda h: h != "no-such-host.example")
+    monkeypatch.setattr(net, "_fetch", lambda u: (u, 401 if "refused" in u else 200))
+    found = net.problems([refused, good, typo, refused])
+    assert set(found) == {refused, typo}
+    assert "sign in" in found[refused] and found[typo] == "no network yet"
+    assert net.first_problem([typo, good, refused]) == "no network yet"     # first in playlist order
+    assert net.problems([good]) == {} and net.first_problem([good]) == ""
+    assert net.problems([refused], online=False) == {refused: "no network yet"}
+
+
+def test_screen_data_names_each_item_that_cannot_be_shown(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import discovery, library, net
+    from app.server import create_app
+    net.reset_cache()
+    monkeypatch.setattr(discovery, "advertise", lambda *a, **k: None)
+    monkeypatch.setattr(discovery, "has_address", lambda: True)
+    cfg = config.load_config()
+    cfg["role"] = "display"
+    config.save_config(cfg)
+    library.add_url("https://docs.google.com/presentation/d/e/2PACX-good/pub", 30)
+    library.add_url("https://docs.google.com/presentation/d/e/2PACX-refused/pub", 30)
+    library.add_url("https://videos.no-such-host.example/clip.mp4", 30)
+    monkeypatch.setattr(net, "_resolves", lambda h: not h.endswith("no-such-host.example"))
+    monkeypatch.setattr(net, "_fetch", lambda u: (u, 401 if "refused" in u else 200))
+    data = TestClient(create_app()).get("/api/screen-data").json()
+    srcs = {i["src"] for i in data["items"]}
+    refused = next(s for s in srcs if "refused" in s)
+    video = next(s for s in srcs if s.endswith("clip.mp4"))
+    assert set(data["blocked"]) == {refused, video}                   # the good deck plays
+    assert data["blocked"][video] == "no network yet"                 # a web video is checked too
+    assert data["content_reachable"] is False and data["content_note"]

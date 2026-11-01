@@ -327,9 +327,10 @@ def can_reach_all(urls, now: float = None) -> bool:
     return not first_problem(urls, now)
 
 
-def first_problem(urls, now: float = None, online: bool = True, starting: bool = False) -> str:
-    """'' when everything is showable, else a short human reason for the first item
-    that isn't — this is what the screen's waiting card and the panel row show.
+def problems(urls, now: float = None, online: bool = True, starting: bool = False) -> dict:
+    """{url: short human reason} for each item that can't be shown right now, {} when
+    all of them can. Each item is judged on its own, so one deck Google is refusing, or
+    one link whose name doesn't resolve, never holds back the rest of the playlist.
 
     `online` is False when the device has no network address at all - before the
     router has answered after a power cut, say. Then there is nothing to ask, so
@@ -338,19 +339,25 @@ def first_problem(urls, now: float = None, online: bool = True, starting: bool =
     screen was switched on."""
     now = time.time() if now is None else now
     _note_online(online, now)
+    found = {}
     for u in urls:
         h = host_of(u)
-        if not h or _is_local(h):
+        if u in found or not h or _is_local(h):
             continue
-        if not online:
-            return "no network yet"
-        if not reachable(h, now, starting):
-            return "no network yet"
-        if is_slides(u):
+        if not online or not reachable(h, now, starting):
+            found[u] = "no network yet"
+        elif is_slides(u):
             ok, reason = probe(u, now, starting)
             if not ok:
-                return reason
-    return ""
+                found[u] = reason
+    return found
+
+
+def first_problem(urls, now: float = None, online: bool = True, starting: bool = False) -> str:
+    """'' when everything is showable, else a short human reason for the first item
+    that isn't — what the screen's waiting card says when nothing can be shown."""
+    found = problems(urls, now, online, starting)
+    return next((found[u] for u in urls if u in found), "")
 
 
 def reset_cache() -> None:

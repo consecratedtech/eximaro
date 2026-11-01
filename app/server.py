@@ -91,6 +91,14 @@ def _startup_left():
     return None if on is None else max(0, min(STARTUP_SCREEN, STARTUP_SCREEN_UNTIL - on))
 
 
+def _fetched_over_network(item: dict) -> bool:
+    """Does showing this item need the internet? The same test as needsNet() on the
+    screen: links, decks and YouTube always; a video only when it is a web link."""
+    if item.get("type") == "url":
+        return True
+    return item.get("type") == "video" and str(item.get("src", "")).lower().startswith(("http://", "https://"))
+
+
 _SETUP_HTML = (Path(__file__).parent / "pages" / "setup.html").read_text(encoding="utf-8")
 _SCREEN_HTML = (Path(__file__).parent / "pages" / "screen.html").read_text(encoding="utf-8")
 _STATIC_DIR = Path(__file__).parent / "static"  # locally-vendored fonts, etc.
@@ -519,25 +527,31 @@ def create_app() -> FastAPI:
             creds = wifi.ap_credentials()
             setup = {"ssid": creds["ssid"], "password": creds["password"]}
         primary = addrs[0]["ip"] if addrs else None
-        # Whether the hosts this playlist needs are answering. A cross-origin iframe
-        # never reports that it failed, so without this the screen cannot tell a loaded
-        # deck from Chromium's offline error page — and paints the error page onto a
-        # public sign. Costs nothing on an all-local playlist: no remote hosts means no
-        # lookup at all, and with no network address there is nothing to look up.
-        remote = [i.get("src", "") for i in items if i.get("type") == "url"]
+        # Whether each item fetched over the internet can be shown now. A cross-origin
+        # iframe never reports that it failed, so without this the screen cannot tell a
+        # loaded deck from Chromium's offline error page — and paints the error page onto
+        # a public sign. Each item is judged on its own, so one deck Google is refusing
+        # never holds back the rest. Costs nothing on an all-local playlist: no remote
+        # hosts means no lookup at all, and with no network address there is nothing to
+        # look up.
+        remote = [i.get("src", "") for i in items if _fetched_over_network(i)]
         since_on = _seconds_since_power_on()
         starting = since_on is not None and since_on < net.STARTUP_GRACE
-        problem = (net.first_problem(remote, online=discovery.has_address(), starting=starting)
-                   if remote else "")
+        blocked = (net.problems(remote, online=discovery.has_address(), starting=starting)
+                   if remote else {})
+        problem = next(iter(blocked.values()), "")
         return {
             "items": items,
             # The code proves someone is standing at this screen, so only the screen
             # itself gets it - this route is open to the whole network.
             "pairing_code": pairing.current_code() if _from_this_device(request) else None,
             "shuffle": shuffle,
-            "content_reachable": not problem,
-            # The reason, when there is one, so the waiting card can say "Google is
-            # asking viewers to sign in" rather than blaming the network.
+            # The items that can't be shown yet, each with its reason; the screen skips
+            # those and plays the rest. When none of them can be shown, it waits.
+            "blocked": blocked,
+            "content_reachable": not blocked,
+            # The first reason, so the waiting card can say "Google is asking viewers to
+            # sign in" rather than blaming the network.
             "content_note": problem,
             # Shown ONLY on the boot splash (never over playing content): a failed
             # update should be visible to whoever walks past a rebooted screen.
