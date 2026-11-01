@@ -49,7 +49,7 @@ curl -s localhost:8080/healthz; echo
 The screen is drawn by the kiosk — **`eximaro-kiosk.service`** (the `cage` compositor running Chromium). If the **panel works in a browser but the TV is blank**, it's this.
 
 **First, the two‑minute physical checks:**
-- Give it **about a minute** after switching it on — the screen shows a **"Starting up…"** splash before content. (After an update or a restart of the screen software it goes straight back to the content.)
+- Give it **about a minute** after switching it on — the screen shows a **"Starting up…"** splash before content. After an update or a restart of the screen software it goes straight back to the content, unless an update failed: then the splash shows what went wrong for a minute each time, until it is dismissed on the panel.
 - **TV** is powered on and set to the **HDMI input** the device is plugged into.
 - **Raspberry Pi 5:** it drives the micro‑HDMI port **nearest the USB‑C power connector**. If the cable's in the other one, the TV stays black — move it.
 
