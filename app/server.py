@@ -564,7 +564,11 @@ def create_app() -> FastAPI:
                       f'<img src="/wifi-qr.png" alt="Join QR" width="200" height="200">')
         else:
             banner = '<p>Enter a WiFi network below and this device will connect to it.</p>'
-        err = f'<p class="err">{_esc(st.get("error"))}</p>' if st.get("error") else ""
+        # A fixed sentence, never the helper's own words: its error text can carry what
+        # was typed (an older helper put the whole join command, Wi-Fi password and
+        # all, into it), and this page can be open to anyone on the network.
+        err = ('<p class="err">Couldn&rsquo;t connect to that network. Check its name '
+               'and password, then try again.</p>') if st.get("error") else ""
         # Only offer to take the setup network down when one is actually running.
         stop_html = ('<form method="post" action="/api/wifi/stop">'
                      '<button class="stop">Stop setup network</button></form>'

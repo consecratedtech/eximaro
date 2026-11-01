@@ -100,6 +100,16 @@ def _nmcli(*args, timeout: int = 30) -> subprocess.CompletedProcess:
     return subprocess.run([NMCLI, *args], capture_output=True, text=True, timeout=timeout)
 
 
+def _scrub(text: str, secret: str) -> str:
+    """nmcli's own error text, trimmed for the status file, with the password blanked
+    out should nmcli ever echo it back. Blank it BEFORE trimming, so a cut can't leave
+    half a password behind."""
+    text = (text or "").strip()
+    if secret:
+        text = text.replace(secret, "***")
+    return text[:200]
+
+
 def _split_terse(line: str) -> list:
     """Split one line of `nmcli -t` output. Terse mode separates fields with ':'
     and escapes any ':' or '\\' inside a value as '\\:' / '\\\\', so a naive split
@@ -204,7 +214,7 @@ def do_hotspot(req) -> None:
         _captive_on()   # turn the setup network into a captive portal
     _write(STATUS, {"ap_active": ok, "ap_ssid": ssid if ok else None,
                     "wifi": "hotspot" if ok else None,
-                    "error": None if ok else r.stderr.strip()[:200], "when": _now()})
+                    "error": None if ok else _scrub(r.stderr, password), "when": _now()})
 
 
 def do_connect(req) -> None:
@@ -231,7 +241,7 @@ def do_connect(req) -> None:
     else:
         _nmcli("connection", "up", "Hotspot", timeout=20)  # restore setup mode to retry
         _captive_on()    # re-arm the portal so a retry still auto-opens
-        _write(STATUS, {"error": f"could not join {ssid}", "detail": r.stderr.strip()[:200],
+        _write(STATUS, {"error": f"could not join {ssid}", "detail": _scrub(r.stderr, password),
                         "ap_active": True, "when": _now()})
 
 
@@ -260,10 +270,16 @@ def main() -> None:
     fn = ACTIONS.get(req.get("action"))
     if not fn:
         return
+    # Never record an exception's own text: a timed-out join's message is the whole
+    # nmcli command line, Wi-Fi password included. Say what kind of failure it was.
     try:
         fn(req)
+    except subprocess.TimeoutExpired:
+        _write(STATUS, {"error": "the network took too long to answer",
+                        "action": req.get("action"), "when": _now()})
     except Exception as exc:  # never leave the request stuck; report and move on
-        _write(STATUS, {"error": str(exc), "action": req.get("action"), "when": _now()})
+        _write(STATUS, {"error": f"the network helper failed ({type(exc).__name__})",
+                        "action": req.get("action"), "when": _now()})
 
 
 if __name__ == "__main__":
