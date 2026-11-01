@@ -15,7 +15,7 @@ import secrets
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerifyMismatchError
 
-from .crypto import Vault
+from .crypto import VAULT_LOCK, Vault
 
 _ph = PasswordHasher()
 
@@ -51,9 +51,10 @@ def clear_credentials() -> None:
 
 
 def get_or_create_site_key() -> str:
-    vault = Vault()
-    key = vault.get("site_key")
-    if not key:
-        key = secrets.token_hex(32)  # 256-bit signing secret
-        vault.set("site_key", key)
-    return key
+    with VAULT_LOCK:                 # one key, even if two callers ask at once
+        vault = Vault()
+        key = vault.get("site_key")
+        if not key:
+            key = secrets.token_hex(32)  # 256-bit signing secret
+            vault.set("site_key", key)
+        return key

@@ -19,6 +19,7 @@ This service listens on the LAN. Login still needs to gate it before release.
 import html as _htmllib
 import io
 import secrets
+import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -93,6 +94,7 @@ def create_app() -> FastAPI:
             base_url, auth.get_or_create_site_key(),
             shuffle=bool(current().get("shuffle")),
             browse=discovery.browse, update=pairing.add_display_record,
+            rename=pairing.rename_display,
         )
 
     def _autopush(background: BackgroundTasks) -> None:
@@ -354,7 +356,7 @@ def create_app() -> FastAPI:
         return RedirectResponse("/", status_code=303)
 
     @app.post("/api/name")
-    def set_name(name: str = Form(...)):
+    def set_name(background: BackgroundTasks, name: str = Form(...)):
         cfg = current()
         cfg["name"] = name.strip() or cfg["name"]
         config.save_config(cfg)
@@ -362,6 +364,9 @@ def create_app() -> FastAPI:
             hostname.apply_hostname(cfg["name"])
         _readvertise()
         activity.log(f"Renamed this device to {cfg['name']}")
+        # A controller's screens show its name: push now so they learn the new one
+        # straight away, not at the next content change. (No-op on a display.)
+        _autopush(background)
         return RedirectResponse("/", status_code=303)
 
     # --- the screen the kiosk shows -----------------------------------------
@@ -832,7 +837,22 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
         )
         if not ok:
             return JSONResponse({"error": "rejected"}, status_code=403)
-        return {"ok": True}
+        # The push is verified, so what it says about its sender can be trusted: keep
+        # the name and address this screen shows for its controller current, and
+        # answer with this screen's own current name so the controller can do the
+        # same the other way round. Names always follow renames, in both directions.
+        # The content is already in place, so a name that can't be saved is reported
+        # to the journal, never turned into a failed push.
+        manifest = body.get("manifest")
+        try:
+            await run_in_threadpool(
+                pairing.refresh_controller,
+                name=manifest.get("from") if isinstance(manifest, dict) else "",
+                address=request.client.host if request.client else "")
+        except Exception as exc:
+            print(f"push: delivered, but could not save the controller's current name "
+                  f"and address: {exc}", file=sys.stderr, flush=True)
+        return {"ok": True, "name": current()["name"]}
 
     # --- pairing: controller side -------------------------------------------
 
@@ -1237,6 +1257,27 @@ def _settings_drawer(cfg: dict, role: str) -> str:
     else:
         display_here_section = ""
 
+    # Pairing controls live here, in Settings, not on the display's home page: a
+    # screen-level Unpair button was being pressed to "fix" a screen that looked
+    # stuck, cutting it off its controller. Unpair still goes through the
+    # confirmation screen at /pair/forget.
+    pairing_section = ""
+    if role != "controller" and pairing.is_claimed():
+        _ctl = pairing.get_controller() or {}
+        _cn = _esc(_ctl.get("name") or "its controller")
+        _ca = f' (<span class="now">{_esc(_ctl["address"])}</span>)' if _ctl.get("address") else ""
+        pairing_section = f"""
+        <div class="section">
+          <h3>Pairing {_tip('pairing')}</h3>
+          <p>Paired to <span class="now">{_cn}</span>{_ca}, which sends this screen its content.</p>
+          <form method="post" action="/api/pair/start">
+            <button class="btn-ghost full" type="submit">Re-pair to another controller</button>
+          </form>
+          <form method="get" action="/pair/forget">
+            <button class="btn-danger full" type="submit">Unpair this screen&hellip;</button>
+          </form>
+        </div>"""
+
     # Sound output. The switch is done by a privileged helper, so what this can offer
     # depends on whether that helper is installed and what it last reported.
     a_state = audio.state()
@@ -1378,6 +1419,8 @@ def _settings_drawer(cfg: dict, role: str) -> str:
         </div>
 
         {display_here_section}
+
+        {pairing_section}
 
         {pw_section}
 
@@ -1986,21 +2029,22 @@ def _display_home(cfg: dict) -> HTMLResponse:
             </form>
           </div>"""
     elif pairing.is_claimed():
+        # Top of a paired screen: who controls it and where, and where to go to change
+        # what it shows - nothing to click here that could cut it off. The name and
+        # address are refreshed by every verified push (pairing.refresh_controller),
+        # so they are the controller's real ones today, renamed or not.
         controller = pairing.get_controller() or {}
+        c_name = _esc(controller.get("name") or "its controller")
+        c_addr = controller.get("address") or ""
+        where = f' at <span class="mono">{_esc(c_addr)}</span>' if c_addr else ""
+        go_there = (f'<a href="http://{_esc(c_addr)}:{config.PORT}/content">open '
+                    f'{c_name}&rsquo;s Content page</a>' if c_addr else f"use {c_name}")
         section = f"""
           <div class="card">
-            <h2>Paired {_tip('pairing')}</h2>
-            <p class="hint">Controlled by
-              <b>{_esc(controller.get('name') or 'a controller')}</b>.
-              Content sent from there will appear on this screen.</p>
-            <div class="row">
-              <form method="post" action="/api/pair/start">
-                <button class="btn-ghost" type="submit">Re-pair to another controller</button>
-              </form>
-              <form method="get" action="/pair/forget">
-                <button class="btn-danger" type="submit">Unpair this screen</button>
-              </form>
-            </div>
+            <h2>Controlled by {c_name} {_tip('pairing')}</h2>
+            <p class="hint">This screen shows what <b>{c_name}</b>{where} sends it.
+              To change what&rsquo;s on it, {go_there}.</p>
+            <p class="hint">Pairing options are in Settings.</p>
           </div>"""
     else:
         section = f"""
@@ -2013,29 +2057,37 @@ def _display_home(cfg: dict) -> HTMLResponse:
           </div>"""
 
     # When a controller has pushed a playlist, let the operator take it down from
-    # the display itself — important if the controller is offline and can't.
+    # the display itself — important if the controller is offline and can't. It sits
+    # BELOW the content, not at the top: at the top it read as the first thing to try
+    # when a screen looked stuck, and people reached for it (or Unpair) to "fix" one.
     pushed = sync.screen_items()
     pushed_card = ""
     if pushed is not None:
-        from_name = _esc((pairing.get_controller() or {}).get("name") or "a controller")
+        from_name = _esc((pairing.get_controller() or {}).get("name") or "its controller")
         pushed_card = f"""
           <div class="card note">
-            <h2>Showing pushed content</h2>
+            <h2>Remove {from_name}&rsquo;s content from this screen</h2>
             <p class="hint">This screen is playing <b>{len(pushed)}</b> item(s) sent from
-              {from_name}, which overrides anything added on this screen. If the controller
-              is offline and you need to take it down, remove it here.</p>
+              {from_name}. Only remove it if {from_name} is offline and it has to come off
+              this screen now &mdash; the next Push from {from_name} puts it back. To
+              change what plays, change it on {from_name} instead.</p>
             <form method="post" action="/api/received/clear"
                   onsubmit="return confirm('Remove the content pushed to this screen? It will fall back to this screen’s own content or the idle screen.');">
               <button class="btn-danger" type="submit">Remove pushed content</button>
             </form>
           </div>"""
 
+    # While a controller's content is playing, this screen's own list does not show -
+    # say so, instead of inviting edits that change nothing on the wall.
+    lead = ("It plays what its controller sends. Content added below only shows if that "
+            "content is removed." if pushed is not None
+            else "Pair it to a controller, or add content directly below.")
     intro = f"""
       <p class="eyebrow">This device shows content {_tip('display')}</p>
       <h1>Display</h1>
-      <p class="lead">Pair it to a controller, or add content directly below.</p>
+      <p class="lead">{lead}</p>
     """
-    return _page("Display", "display", cfg, intro + pushed_card + section + _content_body(cfg))
+    return _page("Display", "display", cfg, intro + section + _content_body(cfg) + pushed_card)
 
 
 def _promote_banner(conv: dict) -> str:

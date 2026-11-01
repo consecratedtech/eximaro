@@ -13,6 +13,7 @@ name or address later without breaking the paired link.
 """
 
 import base64
+import ipaddress
 import secrets
 import time
 import urllib.request
@@ -23,7 +24,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from . import auth, identity
-from .crypto import Vault
+from .crypto import VAULT_LOCK, Vault
 
 CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no 0/O/1/I/L to avoid misreads
 CODE_LENGTH = 8
@@ -87,6 +88,46 @@ def get_controller():
     return Vault().get("controller")
 
 
+def lan_address(value) -> str:
+    """`value` as an IPv4 address someone on the LAN could open in a browser, or ""
+    if it is not one (loopback, a test client's placeholder, anything unexpected).
+    The panel listens on IPv4 only, so an IPv4-mapped IPv6 form is unwrapped."""
+    try:
+        ip = ipaddress.ip_address(str(value or "").strip())
+    except ValueError:
+        return ""
+    ip = getattr(ip, "ipv4_mapped", None) or ip
+    if ip.version != 4 or ip.is_loopback or ip.is_unspecified:
+        return ""
+    return str(ip)
+
+
+def refresh_controller(name: str = "", address: str = "") -> bool:
+    """Display side, after a VERIFIED push: keep this screen's record of its controller
+    current. A push carries the controller's name as it is now and arrives from the
+    address it has now, so a rename or a new DHCP lease is picked up by itself - the
+    screen never goes on naming its controller by whatever it was called the day they
+    were paired. Writes only when something actually changed; True if it did. Never
+    re-creates the record: a screen unpaired a moment ago stays unpaired."""
+    fresh = {
+        "name": name.strip() if isinstance(name, str) else "",
+        "address": lan_address(address),
+    }
+    with VAULT_LOCK:
+        vault = Vault()
+        record = vault.get("controller")
+        if not record:
+            return False
+        changed = False
+        for key, value in fresh.items():
+            if value and record.get(key) != value:
+                record[key] = value
+                changed = True
+        if changed:
+            vault.set("controller", record)
+        return changed
+
+
 def is_claimed() -> bool:
     return Vault().has("controller")
 
@@ -100,15 +141,37 @@ def list_displays() -> list:                     # controller side: its displays
 
 
 def add_display_record(record: dict) -> None:
-    vault = Vault()
-    displays = [d for d in vault.get("displays", []) if d["device_id"] != record["device_id"]]
-    displays.append(record)
-    vault.set("displays", displays)
+    with VAULT_LOCK:
+        vault = Vault()
+        displays = [d for d in vault.get("displays", []) if d["device_id"] != record["device_id"]]
+        displays.append(record)
+        vault.set("displays", displays)
+
+
+def rename_display(device_id: str, name: str) -> bool:
+    """Controller side: remember the name a paired display reported for itself. Only
+    touches a display that is still paired - one removed while a push to it was in
+    flight must not come back. True if the name changed."""
+    name = name.strip() if isinstance(name, str) else ""
+    if not name:
+        return False
+    with VAULT_LOCK:
+        vault = Vault()
+        displays = vault.get("displays", [])
+        for d in displays:
+            if d["device_id"] == device_id:
+                if d.get("name") == name:
+                    return False
+                d["name"] = name
+                vault.set("displays", displays)
+                return True
+        return False
 
 
 def remove_display(device_id: str) -> None:
-    vault = Vault()
-    vault.set("displays", [d for d in vault.get("displays", []) if d["device_id"] != device_id])
+    with VAULT_LOCK:
+        vault = Vault()
+        vault.set("displays", [d for d in vault.get("displays", []) if d["device_id"] != device_id])
 
 
 # --- the claim (runs ON the display when a controller submits the code) ------

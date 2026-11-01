@@ -279,3 +279,60 @@ def test_plain_error_distinguishes_rejection_from_absence():
     from app import sync
     assert "no longer paired" in sync.plain_error("HTTP Error 403: Forbidden", "10.0.0.5", 8080)
     assert "client isolation" in sync.plain_error("<urlopen error [Errno 113] No route to host>", "10.0.0.5", 8080)
+
+
+# --- a renamed display is listed by its real name ---------------------------------
+
+def test_push_targeted_passes_back_the_name_the_display_answers_with(monkeypatch):
+    from app import sync
+    monkeypatch.setattr(sync, "post_json", lambda url, obj, timeout=10: {"ok": True, "name": "eximaro-lobby"})
+    res = sync.push_targeted(_displays(), [], "ctl", "http://c", "ab" * 32)
+    assert res[0]["ok"] is True and res[0]["display_name"] == "eximaro-lobby"
+
+
+def test_push_remembers_a_renamed_display(monkeypatch):
+    from app import sync
+    monkeypatch.setattr(sync, "push_targeted", lambda displays, *a, **k: [
+        {"name": d["name"], "ok": True, "display_name": "eximaro-lobby"} for d in displays])
+    renamed = []
+    sync.push_with_rediscovery(_displays(), [], "ctl", "http://c", "k", browse=lambda t: [],
+                               rename=lambda i, n: renamed.append((i, n)))
+    assert renamed == [("aaaa1111", "eximaro-lobby")]
+
+
+def test_push_does_not_rewrite_a_name_that_did_not_change(monkeypatch):
+    from app import sync
+    monkeypatch.setattr(sync, "push_targeted", lambda displays, *a, **k: [
+        {"name": d["name"], "ok": True, "display_name": d["name"]} for d in displays])
+    renamed = []
+    sync.push_with_rediscovery(_displays(), [], "ctl", "http://c", "k", browse=lambda t: [],
+                               rename=lambda i, n: renamed.append((i, n)))
+    assert renamed == []
+
+
+def test_a_failed_push_renames_nothing(monkeypatch):
+    from app import sync
+    monkeypatch.setattr(sync, "push_targeted", lambda displays, *a, **k: [
+        {"name": d["name"], "ok": False, "error": "timed out"} for d in displays])
+    renamed = []
+    sync.push_with_rediscovery(_displays(), [], "ctl", "http://c", "k", browse=lambda t: [],
+                               rename=lambda i, n: renamed.append((i, n)))
+    assert renamed == []
+
+
+def test_a_name_that_cannot_be_saved_does_not_fail_a_delivered_push(monkeypatch):
+    from app import sync
+    monkeypatch.setattr(sync, "push_targeted", lambda displays, *a, **k: [
+        {"name": d["name"], "ok": True, "display_name": "eximaro-lobby"} for d in displays])
+    def broken(device_id, name):
+        raise OSError("disk full")
+    res = sync.push_with_rediscovery(_displays(), [], "ctl", "http://c", "k",
+                                     browse=lambda t: [], rename=broken)
+    assert res[0]["ok"] is True
+
+
+def test_an_older_display_without_a_name_in_its_answer_is_left_alone(monkeypatch):
+    from app import sync
+    monkeypatch.setattr(sync, "post_json", lambda url, obj, timeout=10: {"ok": True})
+    res = sync.push_targeted(_displays(), [], "ctl", "http://c", "ab" * 32)
+    assert res[0]["ok"] is True and res[0]["display_name"] is None

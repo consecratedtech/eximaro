@@ -11,6 +11,7 @@ key to a TPM / secure element is a future hardening step.
 import json
 import os
 import secrets
+import threading
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -19,22 +20,32 @@ from . import config
 MASTER_KEY_PATH = config.DATA / "master.key"
 VAULT_PATH = config.DATA / "secrets.enc"
 
+# Every read and change of the vault goes through this one lock, held across the
+# whole read-modify-write. The app reaches the vault from request threads,
+# background pushes and the event loop at the same moment - a push landing while
+# someone unpairs, two pushes back to back. Without it, two writers each save
+# their own stale copy and one change is silently lost: a rename disappears, or a
+# display that was just unpaired comes back. Re-entrant, so a caller can hold it
+# around several steps (see pairing.refresh_controller).
+VAULT_LOCK = threading.RLock()
+
 
 def _load_master_key() -> bytes:
-    if MASTER_KEY_PATH.exists():
-        key = MASTER_KEY_PATH.read_bytes()
-        if len(key) == 32:
-            return key
-    config.DATA.mkdir(parents=True, exist_ok=True)
-    key = AESGCM.generate_key(bit_length=256)
-    tmp = MASTER_KEY_PATH.with_suffix(".tmp")
-    tmp.write_bytes(key)
-    os.replace(tmp, MASTER_KEY_PATH)
-    try:
-        os.chmod(MASTER_KEY_PATH, 0o600)
-    except OSError:
-        pass
-    return key
+    with VAULT_LOCK:              # two first-time callers must not mint two keys
+        if MASTER_KEY_PATH.exists():
+            key = MASTER_KEY_PATH.read_bytes()
+            if len(key) == 32:
+                return key
+        config.DATA.mkdir(parents=True, exist_ok=True)
+        key = AESGCM.generate_key(bit_length=256)
+        tmp = MASTER_KEY_PATH.with_suffix(".tmp")
+        tmp.write_bytes(key)
+        os.replace(tmp, MASTER_KEY_PATH)
+        try:
+            os.chmod(MASTER_KEY_PATH, 0o600)
+        except OSError:
+            pass
+        return key
 
 
 class Vault:
@@ -65,17 +76,21 @@ class Vault:
             pass
 
     def get(self, key: str, default=None):
-        return self._read().get(key, default)
+        with VAULT_LOCK:
+            return self._read().get(key, default)
 
     def set(self, key: str, value) -> None:
-        data = self._read()
-        data[key] = value
-        self._write(data)
+        with VAULT_LOCK:
+            data = self._read()
+            data[key] = value
+            self._write(data)
 
     def has(self, key: str) -> bool:
-        return key in self._read()
+        with VAULT_LOCK:
+            return key in self._read()
 
     def delete(self, key: str) -> None:
-        data = self._read()
-        data.pop(key, None)
-        self._write(data)
+        with VAULT_LOCK:
+            data = self._read()
+            data.pop(key, None)
+            self._write(data)

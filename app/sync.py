@@ -11,6 +11,7 @@ so it keeps playing even if the controller later goes offline.
 import hashlib
 import json
 import shutil
+import sys
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -135,8 +136,10 @@ def push_targeted(displays: list, items: list, from_name: str, base_url: str, si
         signature = commands.sign(site_key, canon(manifest))
         url = f"http://{d['address']}:{d['port']}/api/playlist"
         try:
-            post_json(url, {"manifest": manifest, "signature": signature})
-            return {"name": name, "ok": True, "count": len(mine)}
+            resp = post_json(url, {"manifest": manifest, "signature": signature})
+            # The display answers with the name it has NOW (absent on an older one).
+            fresh = resp.get("name") if isinstance(resp, dict) else None
+            return {"name": name, "ok": True, "count": len(mine), "display_name": fresh}
         except Exception as exc:
             return {"name": name, "ok": False, "error": str(exc)}
 
@@ -163,7 +166,8 @@ def plain_error(exc_text: str, address: str, port) -> str:
 
 
 def push_with_rediscovery(displays: list, items: list, from_name: str, base_url: str,
-                          site_key: str, shuffle: bool = False, browse=None, update=None) -> list:
+                          site_key: str, shuffle: bool = False, browse=None, update=None,
+                          rename=None) -> list:
     """push_targeted, plus the thing an operator should never have to do by hand:
     a display's address is captured when it is paired and DHCP can move it any time.
     When a push can't reach a display, look for it on the LAN by its device id; if it
@@ -196,6 +200,21 @@ def push_with_rediscovery(displays: list, items: list, from_name: str, base_url:
         if not r.get("ok"):
             cur = by_id[d["device_id"]]
             r["error"] = plain_error(r.get("error", ""), cur.get("address", "?"), cur.get("port", "?"))
+    # A display that accepted the push said what it is called NOW. If it was renamed
+    # since it was paired, remember that, so this controller lists it - and reports
+    # on it - by its real name rather than the one it had on pairing day. `rename`
+    # only touches a display that is still paired (pairing.rename_display), and a
+    # name that cannot be saved never turns a delivered push into a failed one.
+    if rename is not None:
+        for d, r in zip(displays, results):
+            fresh = r.get("display_name")
+            fresh = fresh.strip() if isinstance(fresh, str) else ""
+            if r.get("ok") and fresh and fresh != by_id[d["device_id"]].get("name"):
+                try:
+                    rename(d["device_id"], fresh)
+                except Exception as exc:
+                    print(f"push: delivered, but could not save the display's new name "
+                          f"{fresh!r}: {exc}", file=sys.stderr, flush=True)
     return results
 
 
