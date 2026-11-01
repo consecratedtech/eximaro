@@ -787,8 +787,18 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
         activity.log("Removed content pushed from the controller")
         return RedirectResponse("/", status_code=303)
 
+    @app.get("/pair/forget", response_class=HTMLResponse)
+    def pair_forget_confirm():
+        """The "are you sure?" screen before a display unpairs. See _unpair_confirm_body."""
+        return _page("Unpair this screen", "display", current(), _unpair_confirm_body())
+
     @app.post("/api/pair/forget")
-    def pair_forget():
+    def pair_forget(confirm: str = Form(default="")):
+        # Unpairing only ever happens from the confirmation screen's explicit "yes".
+        # Anything else - an old cached page, a stray click, a bookmarked form - lands
+        # on the explanation instead of silently cutting the screen off its controller.
+        if confirm != "yes":
+            return RedirectResponse("/pair/forget", status_code=303)
         pairing.forget_controller()
         sync.clear_received()
         activity.log("Unpaired from the controller and cleared its pushed content")
@@ -1543,6 +1553,52 @@ def _update_alert_banner() -> str:
       </div>"""
 
 
+def _unpair_confirm_body() -> str:
+    """What a person sees before unpairing a display from its controller.
+
+    Unpairing used to sit behind the browser's one-line popup ("Unpair this screen and
+    remove the pushed content?"), right beside a Re-pair button. It was easy to click
+    through, and it never said what actually breaks: the controller can no longer send
+    to this screen, and every Push fails until someone pairs it again. On a church
+    screen that is exactly what happened - someone swapping the week's announcements
+    on the display itself unpaired it, and the controller's pushes failed for days.
+    So this spells out the consequence, makes "keep it paired" the obvious choice, and
+    points at the place the content should really be changed: the controller."""
+    controller = pairing.get_controller()
+    if not controller:
+        return """
+          <div class="card">
+            <h2>This screen isn't paired</h2>
+            <p class="hint">There is nothing to unpair.</p>
+            <form method="get" action="/"><button class="btn-ghost" type="submit">Back</button></form>
+          </div>"""
+    name = _esc(controller.get("name") or "the controller")
+    addr = controller.get("address") or ""
+    go_there = (f' <a href="http://{_esc(addr)}:{config.PORT}/content">Open {name}&rsquo;s '
+                f'content page</a>.' if addr else "")
+    return f"""
+          <div class="card">
+            <h2>Unpair this screen from {name}?</h2>
+            <p>This screen is paired to <b>{name}</b>. If you unpair it:</p>
+            <ul class="hint">
+              <li><b>{name} can no longer send anything to this screen.</b> Every Push to it
+                will fail until it is paired again.</li>
+              <li>What {name} sent is taken off this screen straight away.</li>
+            </ul>
+            <p class="hint">Only want to change what this screen shows? Change it on
+              <b>{name}</b> instead &mdash; this screen updates by itself.{go_there}</p>
+            <div class="row">
+              <form method="get" action="/">
+                <button class="btn-primary" type="submit">Keep it paired</button>
+              </form>
+              <form method="post" action="/api/pair/forget">
+                <input type="hidden" name="confirm" value="yes">
+                <button class="btn-danger" type="submit">Yes, unpair this screen</button>
+              </form>
+            </div>
+          </div>"""
+
+
 def _page(title: str, role: str, cfg: dict, body: str, active: str = "home") -> HTMLResponse:
     html = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -1941,8 +1997,7 @@ def _display_home(cfg: dict) -> HTMLResponse:
               <form method="post" action="/api/pair/start">
                 <button class="btn-ghost" type="submit">Re-pair to another controller</button>
               </form>
-              <form method="post" action="/api/pair/forget"
-                    onsubmit="return confirm('Unpair this screen and remove the pushed content? You can pair again later.');">
+              <form method="get" action="/pair/forget">
                 <button class="btn-danger" type="submit">Unpair this screen</button>
               </form>
             </div>
