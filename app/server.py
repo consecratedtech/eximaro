@@ -63,6 +63,30 @@ from . import __version__ as APP_VERSION
 # reaches the display instead of the browser running whatever it loaded at boot.
 _BOOT_ID = str(time.time())
 
+# The startup screen (the address, and a QR code to open it) is for finding a screen
+# that has just been switched on. It shows for a minute, and not at all once the screen
+# has been on for two: a reload after an update, or the browser restarting, goes
+# straight back to the slides.
+STARTUP_SCREEN = 60
+STARTUP_SCREEN_UNTIL = 120
+
+
+def _seconds_since_power_on():
+    """How long ago this device was switched on - not when the app started, which an
+    update or a crash also does. None where the system can't say."""
+    try:
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+    except (AttributeError, OSError):
+        return None
+
+
+def _startup_left():
+    """Seconds the startup screen still has, from now: none once the screen has been on
+    a while. None where the system can't say, which leaves it to the page (a minute)."""
+    on = _seconds_since_power_on()
+    return None if on is None else max(0, min(STARTUP_SCREEN, STARTUP_SCREEN_UNTIL - on))
+
+
 _SETUP_HTML = (Path(__file__).parent / "pages" / "setup.html").read_text(encoding="utf-8")
 _SCREEN_HTML = (Path(__file__).parent / "pages" / "screen.html").read_text(encoding="utf-8")
 _STATIC_DIR = Path(__file__).parent / "static"  # locally-vendored fonts, etc.
@@ -497,7 +521,10 @@ def create_app() -> FastAPI:
         # public sign. Costs nothing on an all-local playlist: no remote hosts means no
         # lookup at all, and with no network address there is nothing to look up.
         remote = [i.get("src", "") for i in items if i.get("type") == "url"]
-        problem = net.first_problem(remote, online=discovery.has_address()) if remote else ""
+        since_on = _seconds_since_power_on()
+        starting = since_on is not None and since_on < net.STARTUP_GRACE
+        problem = (net.first_problem(remote, online=discovery.has_address(), starting=starting)
+                   if remote else "")
         return {
             "items": items,
             # The code proves someone is standing at this screen, so only the screen
@@ -520,6 +547,8 @@ def create_app() -> FastAPI:
                           for a in addrs],
             "wifi_setup": setup,
             "boot": _BOOT_ID,
+            # Read after the checks above, which can take a few seconds just after a boot.
+            "startup_left": _startup_left(),
         }
 
     @app.get("/recv-asset/{name}")
@@ -2042,15 +2071,14 @@ def _update_body(cfg: dict) -> str:
     if _update_running():
         return _nothing_card("An update is already on its way",
                              f"{device} is already getting the newest version, so there is no need to "
-                             f"press it again. When it restarts, its screen shows "
-                             f"&ldquo;Starting up&hellip;&rdquo; for about a minute.")
+                             f"press it again. When it restarts, its screen goes dark for a few "
+                             f"seconds, then carries on.")
     role = cfg.get("role")
     others = bool(pairing.list_displays()) if role == "controller" else pairing.is_claimed()
     bullets = [
         f"{device} downloads the newest version of its app from the internet. Its screen carries on "
         f"as normal meanwhile.",
-        "Then it restarts. Its screen goes dark for a moment, then shows "
-        "&ldquo;Starting up&hellip;&rdquo; for about a minute.",
+        "Then it restarts. Its screen goes dark for a few seconds, then carries on.",
         f"Only {device} is updated. Your other screens keep playing." if others else "",
         ("Everyone is signed out when it restarts. You will need the password to sign in again."
          if auth.has_credentials() else ""),

@@ -260,7 +260,7 @@ def test_update_needs_the_screen_and_the_screen_starts_nothing():
     assert r.headers["location"] == "/update"
     page = client.get("/update").text
     assert not updater.REQUEST_PATH.exists()
-    assert "Starting up" in page and "about a minute" in page and "Not now" in page
+    assert "goes dark for a few seconds, then carries on" in page and "Not now" in page
     assert 'onsubmit="startUpdate();return false;"' in page
     _safe_choice_comes_first(page, "/api/update")
 

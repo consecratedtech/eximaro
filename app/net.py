@@ -53,13 +53,16 @@ def _gate(key: str, now: float):
 _lock = threading.Lock()
 
 
-def _record(key: str, ok: bool, now: float) -> None:
+def _record(key: str, ok: bool, now: float, counts: bool = True) -> None:
     """Track a run of failures; once it has lasted ACTIVE_WINDOW, go quiet. A run left
-    over from long ago (nothing was tried since) starts again rather than counting."""
+    over from long ago (nothing was tried since) starts again rather than counting. A
+    failure that doesn't count (see STARTUP_GRACE) leaves the record as it was."""
     with _lock:
         if ok:
             _failing.pop(key, None)
             _quiet.pop(key, None)
+            return
+        if not counts:
             return
         first = _failing.get(key)
         if first is None or now - first > ACTIVE_WINDOW + QUIET_PERIOD:
@@ -67,6 +70,16 @@ def _record(key: str, ok: bool, now: float) -> None:
         if now - first >= ACTIVE_WINDOW:
             _quiet[key] = now + QUIET_PERIOD
             _failing.pop(key, None)
+
+
+# Straight after a screen is switched on - after a power cut, say - the router often
+# hands out addresses minutes before its own internet is up. Until it is, nothing gets
+# as far as the content's server, so there is no one to keep quiet for, and a screen
+# with slides set up must start them as soon as it can. So for STARTUP_GRACE after
+# power-on, a failure where nothing reached the content (the name didn't resolve, or no
+# connection was made) doesn't count toward the two minutes: the screen keeps checking
+# on the short cycle. Google turning a deck away always counts.
+STARTUP_GRACE = 900
 
 
 def quiet_for(key: str, now: float = None) -> float:
@@ -182,9 +195,10 @@ def _judge(final_url: str, status: int):
     return True, ""
 
 
-def probe(url: str, now: float = None):
+def probe(url: str, now: float = None, starting: bool = False):
     """(ok, reason) for a Google Slides deck: is Google serving it to an anonymous
-    viewer right now? Cached; a failed network fetch reads as not-ok with a reason."""
+    viewer right now? Cached; a failed network fetch reads as not-ok with a reason.
+    `starting`: the screen was switched on less than STARTUP_GRACE ago."""
     now = time.time() if now is None else now
     if _gate(url, now):
         hit = _probe_cache.get(url)
@@ -199,6 +213,7 @@ def probe(url: str, now: float = None):
             hit = _probe_cache.get(url)
         return (hit[1], hit[2]) if hit else (False, "checking the deck")
     try:
+        counts = True
         try:
             ok, reason = _judge(*_fetch(url))
             keep = PROBE_CACHE_SECONDS
@@ -206,17 +221,18 @@ def probe(url: str, now: float = None):
             # The request never got to Google: the name didn't resolve, or no connection
             # was made - the network isn't there yet, which is normal just after a boot.
             # Ask again on the short cycle; the two-minutes-on, fifteen-off rule still
-            # decides how long it keeps trying.
+            # decides how long it keeps trying, once the screen is past starting up.
             why = exc.reason if isinstance(exc.reason, BaseException) else exc
             ok, reason = False, f"could not reach Google ({type(why).__name__})"
             keep = CACHE_SECONDS
+            counts = not starting
         except Exception as exc:
             # Google had the request, but the answer was too slow or was cut off. That
             # may have counted as a view, so it waits as long as an answer would.
             ok, reason = False, f"Google didn't answer in time ({type(exc).__name__})"
             keep = PROBE_CACHE_SECONDS
         _probe_cache[url] = (now, ok, reason, keep)
-        _record(url, ok, now)
+        _record(url, ok, now, counts)
         return ok, reason
     finally:
         _end(url)
@@ -250,9 +266,10 @@ def _resolves(host: str) -> bool:
         socket.setdefaulttimeout(old)
 
 
-def reachable(host: str, now: float = None) -> bool:
+def reachable(host: str, now: float = None, starting: bool = False) -> bool:
     """Is this host resolvable right now? Cached, so a screen polling every few
-    seconds costs one lookup per CACHE_SECONDS rather than one per poll."""
+    seconds costs one lookup per CACHE_SECONDS rather than one per poll. `starting`:
+    the screen was switched on less than STARTUP_GRACE ago."""
     if not host:
         return True                      # local content: nothing to reach
     now = time.time() if now is None else now
@@ -270,7 +287,7 @@ def reachable(host: str, now: float = None) -> bool:
     try:
         ok = _resolves(host)
         _cache[host] = (now, ok)
-        _record(host, ok, now)
+        _record(host, ok, now, counts=not starting)
         return ok
     finally:
         _end(host)
@@ -294,14 +311,15 @@ def can_reach_all(urls, now: float = None) -> bool:
     return not first_problem(urls, now)
 
 
-def first_problem(urls, now: float = None, online: bool = True) -> str:
+def first_problem(urls, now: float = None, online: bool = True, starting: bool = False) -> str:
     """'' when everything is showable, else a short human reason for the first item
     that isn't — this is what the screen's waiting card and the panel row show.
 
     `online` is False when the device has no network address at all - before the
     router has answered after a power cut, say. Then there is nothing to ask, so
     nothing is looked up, and the two-minute clock stands still until there is a
-    network to try again."""
+    network to try again. `starting` is True for the first STARTUP_GRACE after the
+    screen was switched on."""
     now = time.time() if now is None else now
     _note_online(online, now)
     for u in urls:
@@ -310,10 +328,10 @@ def first_problem(urls, now: float = None, online: bool = True) -> str:
             continue
         if not online:
             return "no network yet"
-        if not reachable(h, now):
+        if not reachable(h, now, starting):
             return "no network yet"
         if is_slides(u):
-            ok, reason = probe(u, now)
+            ok, reason = probe(u, now, starting)
             if not ok:
                 return reason
     return ""

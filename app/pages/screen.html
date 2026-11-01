@@ -183,6 +183,10 @@
     let lastUrl = '';      // current connect URL (so the QR refreshes if the IP changes)
     let bootId = '';       // app-start token; when it changes the page reloads itself
     let bootDone = false;  // true after the startup address splash has elapsed
+    let bootTimer = null;  // ends the startup splash
+    let startupKnown = false;  // the server has said how much of the splash is left
+    const STARTUP_MS = 60000;  // the longest the splash ever shows, from when the page loads
+    const pageStart = performance.now();
     const LONE_DECK_REMOUNT_MS = 15 * 60 * 1000;  // how long a bad load can last on a one-deck playlist
     let layers = [];       // mounted layer per item (built once, reused)
 
@@ -298,6 +302,15 @@
           rebuild();
           buildOrder();
           playCurrent();
+        }
+
+        // The first answer says how much of the startup screen is left: none once the
+        // screen has been on a while, so a reload goes straight back to the content.
+        if (!bootDone && !startupKnown && typeof data.startup_left === 'number') {
+          startupKnown = true;
+          clearTimeout(bootTimer);
+          bootTimer = setTimeout(endBoot, Math.max(0,
+            Math.min(data.startup_left * 1000, STARTUP_MS - (performance.now() - pageStart))));
         }
       } catch (e) { /* keep showing what we have if a fetch fails */ }
     }
@@ -641,17 +654,22 @@
       }
     });
 
-    // Show the address for ~1 minute after boot, then hand the screen to content.
-    // That splash exists so someone can find a freshly booted screen on the network.
-    // Opened deliberately from the panel ("Open full-screen view") it is pointless --
-    // you are already on the panel, looking at this device -- and a full minute of
-    // splash just reads as the preview being broken. ?preview goes straight to it.
-    const isPreview = new URLSearchParams(location.search).has('preview');
-    setTimeout(() => {
+    // Show the address for about a minute after the screen is switched on, then hand
+    // the screen to content. That splash exists so someone can find a freshly booted
+    // screen on the network; the server leaves it out once the screen has been on a
+    // while (see loadData). Opened deliberately from the panel ("Open full-screen
+    // view") it is pointless -- you are already on the panel, looking at this device --
+    // and a full minute of splash just reads as the preview being broken. ?preview
+    // goes straight to it.
+    function endBoot() {
+      if (bootDone) return;
       bootDone = true;
+      clearTimeout(bootTimer);
       document.getElementById('boot').style.display = 'none';
       playCurrent();
-    }, isPreview ? 0 : 60000);
+    }
+    if (new URLSearchParams(location.search).has('preview')) endBoot();
+    else bootTimer = setTimeout(endBoot, STARTUP_MS);
 
     loadData();
     // Poll fairly briskly so pushed content and edits appear within a few seconds.

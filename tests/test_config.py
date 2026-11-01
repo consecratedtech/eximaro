@@ -540,3 +540,81 @@ def test_a_run_left_over_from_long_ago_starts_again(monkeypatch):
     net.reachable("docs.google.com", now=1000.0)
     net.reachable("docs.google.com", now=1000.0 + 3 * 3600)
     assert net.quiet_for("docs.google.com", now=1000.0 + 3 * 3600) == 0
+
+
+# --- a screen with slides set up starts them; the startup screen is only for power-on ---
+
+def test_a_screen_just_switched_on_keeps_checking_until_the_internet_is_up(monkeypatch):
+    # After a power cut the router is often back minutes before its internet. A screen
+    # that has just been switched on keeps checking on the short cycle, so its slides
+    # start as soon as the internet answers; once past starting up, the rule is back.
+    from app import net
+    net.reset_cache()
+    up = {"ok": False}
+    calls = []
+    monkeypatch.setattr(net, "_resolves", lambda h: (calls.append(h), up["ok"])[1])
+    monkeypatch.setattr(net, "_fetch", lambda u: (u, 200))
+    for s in range(0, 600, 3):                                  # ten minutes, no internet
+        assert net.first_problem([DECK], now=1000.0 + s, starting=True) == "no network yet"
+    assert net.quiet_for("docs.google.com", now=1600.0) == 0    # never went quiet
+    assert 28 <= len(calls) <= 30                               # one lookup per 20 s
+    up["ok"] = True
+    assert net.first_problem([DECK], now=1620.0, starting=True) == ""   # slides play
+
+    net.reset_cache()
+    up["ok"] = False
+    for s in range(0, 600, 3):
+        net.first_problem([DECK], now=1000.0 + s, starting=True)
+    for s in range(600, 800, 3):                                # past starting up
+        net.first_problem([DECK], now=1000.0 + s, starting=False)
+    assert net.quiet_for("docs.google.com", now=1800.0) > 0     # two minutes, then quiet
+
+
+def test_google_turning_a_deck_away_counts_even_while_starting(monkeypatch):
+    from app import net
+    net.reset_cache()
+    monkeypatch.setattr(net, "_resolves", lambda h: True)
+
+    def unreachable(u):
+        raise urllib.error.URLError(ConnectionRefusedError())
+    monkeypatch.setattr(net, "_fetch", unreachable)
+    for s in range(0, 600, 3):                                  # nothing gets to Google
+        net.first_problem([DECK], now=1000.0 + s, starting=True)
+    assert net.quiet_for(DECK, now=1600.0) == 0
+    monkeypatch.setattr(net, "_fetch", lambda u: (u, 401))      # Google says no
+    net.first_problem([DECK], now=1620.0, starting=True)
+    net.first_problem([DECK], now=1620.0 + net.PROBE_CACHE_SECONDS + 1, starting=True)
+    assert net.quiet_for(DECK, now=1620.0 + net.PROBE_CACHE_SECONDS + 2) > 0
+
+
+def test_the_startup_screen_shows_only_just_after_power_on(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import discovery, server
+    from app.server import create_app
+    monkeypatch.setattr(discovery, "advertise", lambda *a, **k: None)
+    on = server._seconds_since_power_on()
+    assert on is None or on > 0
+    client = TestClient(create_app())
+    for on, left in ((35.0, 60), (100.0, 20), (119.0, 1), (200.0, 0), (None, None)):
+        monkeypatch.setattr(server, "_seconds_since_power_on", lambda on=on: on)
+        assert client.get("/api/screen-data").json()["startup_left"] == left, on
+
+
+def test_screen_data_tells_the_checks_when_the_screen_was_just_switched_on(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import discovery, library, net, server
+    from app.server import create_app
+    net.reset_cache()
+    monkeypatch.setattr(discovery, "advertise", lambda *a, **k: None)
+    monkeypatch.setattr(discovery, "has_address", lambda: True)
+    cfg = config.load_config()
+    cfg["role"] = "display"
+    config.save_config(cfg)
+    library.add_url(DECK, 30)
+    seen = []
+    monkeypatch.setattr(net, "first_problem", lambda urls, **kw: (seen.append(kw.get("starting")), "")[1])
+    client = TestClient(create_app())
+    for on in (60.0, net.STARTUP_GRACE + 1, None):
+        monkeypatch.setattr(server, "_seconds_since_power_on", lambda on=on: on)
+        client.get("/api/screen-data")
+    assert seen == [True, False, False]
