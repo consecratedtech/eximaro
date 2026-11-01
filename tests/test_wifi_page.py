@@ -213,3 +213,30 @@ def test_a_real_network_in_the_same_range_is_not_the_setup_network(monkeypatch):
     assert client.post("/api/wifi/connect", data={"ssid": "Elsewhere"},
                        follow_redirects=False).status_code == 401
     assert not wifi.pending()
+
+
+BOTH = [{"ip": "192.0.2.10", "iface": "wlan0", "wifi": True, "label": "Wi-Fi"},
+        {"ip": "192.0.2.11", "iface": "eth0", "wifi": False, "label": "Ethernet"}]
+
+
+def test_a_screen_on_cable_and_wifi_is_told_the_truth(monkeypatch):
+    _on(monkeypatch, BOTH)
+    _client(role="display", name="Lobby")
+    from app.server import create_app
+    app = create_app()
+    over_wifi = TestClient(app, client=LAN, base_url="http://192.0.2.10:8080").post(
+        "/api/wifi/connect", data={"ssid": "Office"}).text
+    assert "Move Lobby to Office?" in over_wifi and 'class="danger"' in over_wifi
+    assert "this page stops answering here" in over_wifi
+    assert 'reachable at <a href="http://192.0.2.11:8080">' in over_wifi
+    assert "nothing it&rsquo;s doing now stops" not in over_wifi
+    over_cable = TestClient(app, client=LAN, base_url="http://192.0.2.11:8080").post(
+        "/api/wifi/connect", data={"ssid": "Office"}).text
+    assert "This page stays open: it reached the screen over its network cable." in over_cable
+
+
+def test_the_setup_page_promises_only_what_holds(monkeypatch):
+    monkeypatch.setattr(discovery, "hosting_ap", lambda: True)
+    page = TestClient(_client(role="display").app, client=PHONE, base_url=SETUP_HOST).get("/wifi-setup").text
+    assert "within a minute" not in page
+    assert "normally brings the setup network back" in page and "network cable" in page

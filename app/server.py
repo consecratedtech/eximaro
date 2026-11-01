@@ -602,8 +602,9 @@ def create_app() -> FastAPI:
         # nobody said so.
         next_html = ('<p class="note">When you tap Connect, this setup network goes away '
                      'while the screen joins yours, and your phone drops off it. If the screen '
-                     'can&rsquo;t join, the setup network comes back within a minute so you can '
-                     'try again.</p>') if on_setup_network else ""
+                     'can&rsquo;t join, it normally brings the setup network back so you can try '
+                     'again. If that hasn&rsquo;t happened after a few minutes, connect the screen '
+                     'to your router with a network cable to finish.</p>') if on_setup_network else ""
         # Only offer to take the setup network down when one is running, and only from the
         # normal network: from a phone ON the setup network it would just cut that phone off.
         stop_html = ('<form method="post" action="/api/wifi/stop">'
@@ -647,7 +648,8 @@ def create_app() -> FastAPI:
         # network this page is open on, so that gets a screen first - sent as this POST's
         # answer, never a redirect, so the password never ends up in an address.
         if confirm != "yes" and not _via_setup_network(request):
-            return _wifi_move_screen(current(), ssid, password)
+            here = (request.scope.get("server") or ("", 0))[0]
+            return _wifi_move_screen(current(), ssid, password, here)
         wifi.request_connect(ssid, password)
         activity.log("Joining a WiFi network", ssid)
         return RedirectResponse("/wifi-setup", status_code=303)
@@ -2226,19 +2228,20 @@ def _wifi_shell(title: str, body: str) -> str:
 </body></html>"""
 
 
-def _wifi_move_screen(cfg: dict, ssid: str, password: str) -> HTMLResponse:
+def _wifi_move_screen(cfg: dict, ssid: str, password: str, here: str = "") -> HTMLResponse:
     """The screen before sending a device to a Wi-Fi network from the normal network.
 
-    It says only what is certain: a device without a cable leaves the network it is on
-    at once (so this page stops answering), and a network cable gets it back. Whether a
-    failed join finds its way back by itself depends on the networks around it, so the
-    screen doesn't promise it."""
+    It says only what is certain. A device on Wi-Fi leaves that network at once, so a page
+    open on its Wi-Fi address stops answering; a network cable, when there is one, keeps
+    it reachable. Whether a failed join finds its way back by itself depends on the
+    networks around it, so the screen doesn't promise it. `here` is the address this page
+    was reached on."""
     name, new = _esc(cfg["name"]), _esc(ssid)
     real = [a for a in discovery.labeled_ips() if not a["ip"].startswith(discovery.AP_SUBNET)]
-    wired = any(a["label"] == "Ethernet" for a in real)
+    cable = [a["ip"] for a in real if a["label"] == "Ethernet"]
     on_wifi = any(a["label"] == "Wi-Fi" for a in real)
     current_ssid = wifi.status().get("ssid") if on_wifi else None
-    if wired:
+    if cable and not on_wifi:
         title, lead = f"Connect {name} to {new}?", "If you continue:"
         bullets = ["It stays on its network cable as well, so nothing it&rsquo;s doing now stops.",
                    f"If the name or password is wrong, it simply won&rsquo;t join {new}."]
@@ -2247,12 +2250,22 @@ def _wifi_move_screen(cfg: dict, ssid: str, password: str) -> HTMLResponse:
         cur = f"<b>{_esc(current_ssid)}</b>" if current_ssid else "the network it&rsquo;s on now"
         title = f"Move {name} to {new}?"
         lead = "Check the network name and password first. If you continue:"
-        bullets = [f"{name} leaves {cur} right away, and this page stops answering here.",
-                   f"Once it&rsquo;s on {new}, open its page from a phone or computer on {new}.",
-                   f"If it can&rsquo;t join {new} &mdash; a wrong password, or out of range &mdash; "
-                   f"it may not be reachable until it&rsquo;s back on {cur}. Plugging in a "
-                   "network cable brings it back."]
-        # A controller reaches its displays over the network they share.
+        if cable:
+            link = f"http://{cable[0]}:{config.PORT}"
+            wired = f'<a href="{_esc(link)}">{_esc(link)}</a>'
+            bullets = [f"{name} leaves {cur} right away"
+                       + (". This page stays open: it reached the screen over its network cable."
+                          if here in cable else ", and this page stops answering here."),
+                       f"Once it&rsquo;s on {new}, open its page from a phone or computer on {new}.",
+                       f"Its network cable keeps it reachable at {wired}, even if it can&rsquo;t join {new}."]
+        else:
+            bullets = [f"{name} leaves {cur} right away, and this page stops answering here.",
+                       f"Once it&rsquo;s on {new}, open its page from a phone or computer on {new}.",
+                       f"If it can&rsquo;t join {new} &mdash; a wrong password, or out of range &mdash; "
+                       f"it may not be reachable until it&rsquo;s back on {cur}. Plugging in a "
+                       "network cable brings it back."]
+        # A controller reaches its displays over the network they share (on a device with
+        # both, that is its Wi-Fi address: the one it shows and pairs with).
         role = cfg.get("role")
         controller = pairing.get_controller() if role == "display" else None
         displays = pairing.list_displays() if role == "controller" else []
