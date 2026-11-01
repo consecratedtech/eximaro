@@ -2169,7 +2169,7 @@ def _page(title: str, role: str, cfg: dict, body: str, active: str = "home") -> 
 
 
 def _splash(cfg: dict) -> HTMLResponse:
-    return HTMLResponse(_SETUP_HTML.replace("__DEVICE_NAME__", cfg["name"]))
+    return HTMLResponse(_SETUP_HTML.replace("__DEVICE_NAME__", _esc(cfg["name"])))
 
 
 def _login_page(cfg: dict, error: str = "") -> HTMLResponse:
@@ -2689,6 +2689,8 @@ def _control_home(cfg: dict) -> HTMLResponse:
         </details>
       </div>
       <script>
+      // Names come from whatever answers on the network, so they go in as text.
+      const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
       async function findDisplays(){
         const box=document.getElementById('found');
         box.textContent='Scanning…';
@@ -2698,11 +2700,11 @@ def _control_home(cfg: dict) -> HTMLResponse:
           const list=(d.devices||[]).filter(x=>x.role!=='controller');
           if(!list.length){box.textContent='No displays found. Start pairing on the display, or use Add by address.';return;}
           box.innerHTML=list.map(x=>`<div class="item">
-            <span class="name">${x.name||x.address}</span><span class="meta">${x.address}</span>
+            <span class="name">${esc(x.name||x.address)}</span><span class="meta">${esc(x.address)}</span>
             ${x.paired?'<span class="meta">paired</span>':
               `<form method="post" action="/api/displays/add" style="margin:0">
-                 <input type="hidden" name="address" value="${x.address}">
-                 <input type="hidden" name="port" value="${x.port}">
+                 <input type="hidden" name="address" value="${esc(x.address)}">
+                 <input type="hidden" name="port" value="${esc(x.port)}">
                  <input name="code" placeholder="CODE" required style="width:110px">
                  <button class="btn-primary" type="submit">Pair</button>
                </form>`}
