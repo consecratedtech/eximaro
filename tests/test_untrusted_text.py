@@ -138,3 +138,18 @@ def test_the_screen_never_gets_a_script_link_that_arrived_earlier():
                 "shuffle": False})
     data = _client(role="display").get("/api/screen-data").json()
     assert [i["src"] for i in data["items"]] == ["https://example.com/"]
+
+
+# --- the pairing code stays on the screen ------------------------------------------
+
+def test_only_the_screen_itself_gets_the_pairing_code():
+    from app import pairing
+    from app.server import create_app
+    _client(role="display")
+    code = pairing.start_pairing()
+    app = create_app()
+    assert TestClient(app, client=("127.0.0.1", 50000)).get("/api/screen-data").json()["pairing_code"] == code
+    for host in ("192.0.2.50", "10.42.0.7", "testclient"):
+        data = TestClient(app, client=(host, 50000)).get("/api/screen-data").json()
+        assert data["pairing_code"] is None
+    pairing.cancel_pairing()

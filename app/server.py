@@ -18,6 +18,7 @@ This service listens on the LAN. Login still needs to gate it before release.
 
 import html as _htmllib
 import io
+import ipaddress
 import secrets
 import sys
 import time
@@ -414,7 +415,7 @@ def create_app() -> FastAPI:
         return HTMLResponse(_SCREEN_HTML)
 
     @app.get("/api/screen-data")
-    def screen_data():
+    def screen_data(request: Request):
         cfg = current()
         is_controller = cfg.get("role") == "controller"
         # A controller can mirror the playlist on its own screen too (default), or be
@@ -470,7 +471,9 @@ def create_app() -> FastAPI:
         primary = addrs[0]["ip"] if addrs else None
         return {
             "items": items,
-            "pairing_code": pairing.current_code(),
+            # The code proves someone is standing at this screen, so only the screen
+            # itself gets it - this route is open to the whole network.
+            "pairing_code": pairing.current_code() if _from_this_device(request) else None,
             "shuffle": shuffle,
             # Whether the hosts this playlist needs are answering. A cross-origin
             # iframe never reports that it failed, so without this the screen cannot
@@ -2169,6 +2172,17 @@ def _page(title: str, role: str, cfg: dict, body: str, active: str = "home") -> 
   {_SETTINGS_JS}
 </body></html>"""
     return HTMLResponse(html)
+
+
+def _from_this_device(request: Request) -> bool:
+    """Did this request come from the device itself - the kiosk browser on the TV?"""
+    try:
+        ip = ipaddress.ip_address(request.client.host if request.client else "")
+    except ValueError:
+        return False
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_loopback
 
 
 def _splash(cfg: dict) -> HTMLResponse:
