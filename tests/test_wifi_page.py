@@ -199,3 +199,17 @@ def test_from_the_normal_network_the_off_switch_is_offered(monkeypatch):
 def test_a_phone_on_the_setup_network_cannot_turn_it_off_when_locked(monkeypatch):
     client = TestClient(_locked(monkeypatch, hosting=True), client=PHONE, base_url=SETUP_HOST)
     assert client.post("/api/wifi/stop", follow_redirects=False).status_code == 401
+
+
+# --- review follow-ups -----------------------------------------------------------------
+
+def test_a_real_network_in_the_same_range_is_not_the_setup_network(monkeypatch):
+    # A LAN that hands out 10.42.0.x (a laptop sharing its connection does) is not this
+    # screen's setup network: the request didn't arrive at the setup gateway address.
+    client = TestClient(_locked(monkeypatch, hosting=True), client=("10.42.0.57", 50000),
+                        base_url="http://lobby.local:8080")
+    r = client.get("/wifi-setup", follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/login"
+    assert client.post("/api/wifi/connect", data={"ssid": "Elsewhere"},
+                       follow_redirects=False).status_code == 401
+    assert not wifi.pending()

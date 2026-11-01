@@ -219,9 +219,17 @@ def create_app() -> FastAPI:
         return _ap_cache["val"]
 
     def _via_setup_network(request: Request) -> bool:
-        """Did this request arrive over the setup network this device is hosting?"""
-        client = request.client.host if request.client else ""
-        return client.startswith(discovery.AP_SUBNET) and _hosting_ap_cached()
+        """Did this request arrive over the setup network this device is hosting? Both
+        ends have to fit: the phone has a setup-network address, AND it reached us at the
+        setup network's own gateway address. A real network that happens to use the same
+        10.42 range never does both."""
+        server = (request.scope.get("server") or ("", 0))[0]
+        try:
+            client = ipaddress.ip_address(request.client.host if request.client else "")
+        except ValueError:
+            return False
+        return (server == wifi.AP_GATEWAY and client in _SETUP_NETWORK
+                and _hosting_ap_cached())
 
     @app.middleware("http")
     async def _auth_gate(request: Request, call_next):
@@ -2270,6 +2278,10 @@ def _wifi_move_screen(cfg: dict, ssid: str, password: str) -> HTMLResponse:
 </form>"""
     # The password rides along in the yes form, so this page must never be kept.
     return HTMLResponse(_wifi_shell("WiFi setup", body), headers={"Cache-Control": "no-store"})
+
+
+# The network NetworkManager gives the setup hotspot (gateway wifi.AP_GATEWAY).
+_SETUP_NETWORK = ipaddress.ip_network("10.42.0.0/24")
 
 
 def _from_this_device(request: Request) -> bool:
