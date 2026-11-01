@@ -189,6 +189,7 @@
     const STARTUP_MS = 60000;  // the longest the splash ever shows, from when the page loads
     const pageStart = performance.now();
     const LONE_DECK_REMOUNT_MS = 15 * 60 * 1000;  // how long a bad load can last on a one-deck playlist
+    const FAILED_WAIT_MS = 15 * 60 * 1000;  // a video that wouldn't play is left alone this long
     let layers = [];       // mounted layer per item (built once, reused)
 
     let cycleTimer = null;   // advances items, and slides WITHIN a pptx slideshow
@@ -393,6 +394,7 @@
       if (ytBeat) { clearInterval(ytBeat); ytBeat = null; }
       clearPendingSlide();
       layers.forEach(e => {
+        e.ytWaiting = false;          // only the video being played may take a card down
         const v = e.el.querySelector('video');
         if (v) { v.onended = null; v.onerror = null; try { v.pause(); } catch (_) {} }
         // Layers stay mounted (opacity 0) so their iframes keep running — pause a
@@ -412,9 +414,12 @@
       if (it.type === 'video') return /^https?:/i.test(it.src || '');
       return false;
     }
-    // Can this item be shown right now? Local items always; one fetched over the
-    // internet only once the server says it can be reached (see loadData).
-    function canShow(it) {
+    // Can this item (at index i) be shown right now? Not a video that just failed to
+    // play; otherwise local items always, and one fetched over the internet once the
+    // server says it can be reached (see loadData).
+    function canShow(it, i) {
+      const e = layers[i];
+      if (e && e.failedAt && performance.now() - e.failedAt < FAILED_WAIT_MS) return false;
       if (!needsNet(it)) return true;
       return blocked ? !blocked.has(it.src) : contentReachable;
     }
@@ -448,7 +453,7 @@
       // Chromium's offline dinosaur ends up on the wall and stays there. On a Wi-Fi
       // device this is routine at boot: the radio associates after the app is already
       // up. Prefer content we can actually show; otherwise wait and retry.
-      if (!canShow(item)) {
+      if (!canShow(item, idx)) {
         if (items.some(canShow)) { advance(); return; }             // something else can be shown
         netwait.style.display = 'flex';
         layers.forEach(e => e.el.classList.remove('active'));
@@ -537,19 +542,23 @@
       // is rejected, so fall back to muted so the video still shows, not freezes.
       v.muted = !item.sound;
       v.defaultMuted = v.muted;
+      if (v.error) v.load();   // it failed last time: fetch it again rather than replay the failure
       try { v.currentTime = 0; } catch (e) {}
       const p = v.play();
       if (p && p.catch) p.catch(() => {
         if (!v.muted) { v.muted = true; v.defaultMuted = true; v.play().catch(() => {}); }
       });
       if (single) {
-        v.onerror = () => { idle.style.display = 'flex'; };  // a broken lone video → idle, not black
+        // A lone video that won't play: the waiting card, not a black frame - and not
+        // the set-up screen, because something IS set up. It is tried again later.
+        v.onerror = () => { entry.failedAt = performance.now(); playCurrent(); };
         return;
       }
       let done = false;
       const finish = () => { if (done) return; done = true; v.onended = null; v.onerror = null; advance(); };
       v.onended = finish;
-      v.onerror = () => setTimeout(finish, 1000);  // a broken/unreachable video is skipped promptly
+      // A broken/unreachable video is skipped promptly, then left alone for a while.
+      v.onerror = () => { entry.failedAt = performance.now(); setTimeout(finish, 1000); };
       // Advance when the video ends. Fail-safe: the user's cap if set, else the
       // real duration once known, else a sane bound — never 30 minutes of black.
       const fallback = () => (isFinite(v.duration) && v.duration > 0) ? (v.duration + 5) * 1000 : 600000;
@@ -584,6 +593,7 @@
       entry.ytSingle = single;
       entry.ytAlive = false;
       entry.ytCcDone = false;
+      entry.ytWaiting = false;
       // A lone video loops seamlessly via YouTube's own loop (no API round-trip), so
       // it can't get stuck on the end screen if a message is missed. A video in a
       // list must NOT loop — native loop suppresses the "ended" event we advance on.
@@ -600,11 +610,17 @@
       iframe.src = src;                               // reassigning src restarts from the top
       pendingSlide = { iframe, timer: setTimeout(go, 3500) };  // reveal anyway if onload never fires
       if (single) {
-        // A lone video loops itself; if it never reports life (offline, blocked,
-        // removed), fall back to the idle screen instead of a black frame — the
-        // same courtesy a broken uploaded video gets. The handshake retries for
-        // ~9s, so silence past 12s means it genuinely isn't playing.
-        cycleTimer = setTimeout(() => { if (!entry.ytAlive) { idle.style.display = 'flex'; } }, 12000);
+        // A lone video loops itself. If it hasn't reported life after 12 s (offline,
+        // blocked, removed), the waiting card goes up instead of a black frame - not
+        // the set-up screen, because something IS set up. The handshake keeps going,
+        // so a slow player that answers later takes the card down again (see the
+        // message handler), and the video is mounted afresh after a while if it never does.
+        cycleTimer = setTimeout(() => {
+          if (entry.ytAlive) return;
+          entry.ytWaiting = true;
+          netwait.style.display = 'flex';
+          cycleTimer = setTimeout(playCurrent, LONE_DECK_REMOUNT_MS);
+        }, 12000);
       } else {
         // Bridge until the video reports its length; the first report retunes this
         // to the real time remaining. If no report ever comes, skip, don't freeze.
@@ -621,8 +637,11 @@
       let tries = 0;
       ytListen(iframe);
       ytBeat = setInterval(() => {
-        if (entry.ytAlive || tries++ > 15 || !iframe.isConnected) { clearInterval(ytBeat); ytBeat = null; return; }
-        ytListen(iframe);
+        if (entry.ytAlive || !iframe.isConnected) { clearInterval(ytBeat); ytBeat = null; return; }
+        // Every 0.6 s for about 10 s, then every 3 s, so a player that is slow to start
+        // still hears it and can say it is playing.
+        tries += 1;
+        if (tries <= 15 || tries % 5 === 0) ytListen(iframe);
       }, 600);
     }
 
@@ -639,6 +658,12 @@
       const iframe = entry.el.querySelector('iframe');
       if (!iframe || ev.source !== iframe.contentWindow) return;
       entry.ytAlive = true;                           // the player is answering — it's really playing
+      if (entry.ytWaiting) {                          // a slow lone video answered after all
+        entry.ytWaiting = false;
+        netwait.style.display = 'none';
+        clearTimeout(cycleTimer);                     // no need to mount it afresh
+        cycleTimer = null;
+      }
 
       // Captions off: a muted YouTube video auto-shows captions, and cc_load_policy=0
       // in the URL doesn't stop it — so once the player answers, tell it to drop the
