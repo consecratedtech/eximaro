@@ -422,6 +422,7 @@
       if (!bootDone) return;                       // boot splash owns the screen first
       if (!items.length) {                         // nothing to play → idle/setup screen
         idle.style.display = 'flex';
+        netwait.style.display = 'none';            // nothing to wait for: the set-up screen shows
         layers.forEach(e => e.el.classList.remove('active'));
         return;
       }
