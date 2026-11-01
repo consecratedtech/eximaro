@@ -293,6 +293,9 @@
         // says it for the whole playlist.
         blocked = (data.blocked && typeof data.blocked === 'object')
           ? new Map(Object.entries(data.blocked)) : null;
+        // A web page that can't be reached right now may end up on Chromium's error page
+        // if it reloads itself, so it is loaded again before it is next shown.
+        layers.forEach(e => { if (e.page && !reachableNow(e.item)) e.stale = true; });
         // The server says WHY when it can't be shown ("no network yet", or Google asking
         // viewers to sign in). Show that, so a sign-in wall is never misread as wifi.
         const why = document.getElementById('netwaitWhy');
@@ -310,6 +313,12 @@
           buildOrder();
           playCurrent();
         }
+
+        // A lone web page on screen that couldn't be reached for a while: load it again
+        // now that it can be. (In a longer playlist that happens on its next turn.)
+        const lone = items.length === 1 ? layers[0] : null;
+        if (bootDone && lone && lone.stale && reachableNow(lone.item)
+            && lone.el.classList.contains('active')) playCurrent();
 
         // The first answer says how much of the startup screen is left: none once the
         // screen has been on a while, so a reload goes straight back to the content.
@@ -365,6 +374,10 @@
         } else {
           const src = (item.type === 'url' || item.type === 'image') ? embedSrc(item.src) : '';
           entry = { key, item, src, slides: item.type === 'url' && isSlides(item.src || ''), el: buildLayer(item) };
+          // A plain web page loads once, here, and a frame never retries by itself: if it
+          // can't be reached right now, it is loaded again before it is shown.
+          entry.page = item.type === 'url' && !entry.slides && !item.youtube;
+          entry.stale = entry.page && !reachableNow(item);
           stage.appendChild(entry.el);
         }
         next.push(entry);
@@ -414,14 +427,18 @@
       if (it.type === 'video') return /^https?:/i.test(it.src || '');
       return false;
     }
+    // Can what this item fetches over the internet be reached right now, as far as the
+    // server knows (see loadData)? Always, for a local item.
+    function reachableNow(it) {
+      if (!needsNet(it)) return true;
+      return blocked ? !blocked.has(it.src) : contentReachable;
+    }
     // Can this item (at index i) be shown right now? Not a video that just failed to
-    // play; otherwise local items always, and one fetched over the internet once the
-    // server says it can be reached (see loadData).
+    // play, nor anything that can't be reached yet.
     function canShow(it, i) {
       const e = layers[i];
       if (e && e.failedAt && performance.now() - e.failedAt < FAILED_WAIT_MS) return false;
-      if (!needsNet(it)) return true;
-      return blocked ? !blocked.has(it.src) : contentReachable;
+      return reachableNow(it);
     }
     function revealLayer(idx) {
       layers.forEach((e, n) => e.el.classList.toggle('active', n === idx));
@@ -473,9 +490,24 @@
         // from Google again on every turn of a playlist whose other items are waiting.
         playSlidesDeck(idx, single || items.filter(canShow).length === 1);
       } else {
-        revealLayer(idx);
-        if (!single) cycleTimer = setTimeout(advance, dur(item));
+        playPage(idx, single);
       }
+    }
+
+    // A web page: show it, and move on after its time. One that couldn't be reached
+    // since it was last loaded may be holding Chromium's error page, so it is loaded
+    // again first; the previous layer stays up until it has.
+    function playPage(idx, single) {
+      const entry = layers[idx];
+      const show = () => { revealLayer(idx); if (!single) cycleTimer = setTimeout(advance, dur(entry.item)); };
+      const iframe = entry.stale ? entry.el.querySelector('iframe') : null;
+      if (!iframe) { show(); return; }
+      entry.stale = false;
+      let done = false;
+      const go = () => { if (done) return; done = true; clearPendingSlide(); show(); };
+      iframe.onload = go;
+      iframe.src = entry.src;
+      pendingSlide = { iframe, timer: setTimeout(go, 3500) };  // fail-safe if onload never fires
     }
 
     // A pptx: one item, many image slides. Step through them, then move on (or
