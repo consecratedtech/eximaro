@@ -163,10 +163,15 @@ class _StopAtSignIn(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         if _to_sign_in(newurl):
             return None          # urllib then raises HTTPError for this redirect
+        req.answered = True      # Google did answer this request - with a redirect
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 _opener = urllib.request.build_opener(_StopAtSignIn)
+
+
+class _RedirectFailed(Exception):
+    """Google answered with a redirect, and where it pointed couldn't be reached."""
 
 
 def _fetch(url: str):
@@ -182,6 +187,11 @@ def _fetch(url: str):
             if 300 <= e.code < 400 and location:
                 return urljoin(url, location), e.code
             return e.geturl() or url, e.code
+    except urllib.error.URLError as e:
+        if getattr(req, "answered", False):
+            # The request DID get to Google; only the hop after its redirect failed.
+            raise _RedirectFailed(str(e.reason)) from e
+        raise
 
 
 def _judge(final_url: str, status: int):
@@ -226,6 +236,12 @@ def probe(url: str, now: float = None, starting: bool = False):
             ok, reason = False, f"could not reach Google ({type(why).__name__})"
             keep = CACHE_SECONDS
             counts = not starting
+        except _RedirectFailed:
+            # Google answered, with a redirect, but where it pointed couldn't be reached
+            # (a filter that intercepts secure connections, say). Google had the request,
+            # so this waits as long as an answer would, and it counts.
+            ok, reason = False, "Google sent the deck somewhere this screen can't reach"
+            keep = PROBE_CACHE_SECONDS
         except Exception as exc:
             # Google had the request, but the answer was too slow or was cut off. That
             # may have counted as a view, so it waits as long as an answer would.

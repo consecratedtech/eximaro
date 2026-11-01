@@ -82,7 +82,11 @@ def _seconds_since_power_on():
 
 def _startup_left():
     """Seconds the startup screen still has, from now: none once the screen has been on
-    a while. None where the system can't say, which leaves it to the page (a minute)."""
+    a while. None where the system can't say, which leaves it to the page (a minute).
+    After a failed update it gets its minute again, because that is where the screen
+    says so - until the problem is cleared on the panel."""
+    if updater.alert():
+        return STARTUP_SCREEN
     on = _seconds_since_power_on()
     return None if on is None else max(0, min(STARTUP_SCREEN, STARTUP_SCREEN_UNTIL - on))
 

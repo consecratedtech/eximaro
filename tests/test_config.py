@@ -618,3 +618,57 @@ def test_screen_data_tells_the_checks_when_the_screen_was_just_switched_on(monke
         monkeypatch.setattr(server, "_seconds_since_power_on", lambda on=on: on)
         client.get("/api/screen-data")
     assert seen == [True, False, False]
+
+
+def test_a_redirect_from_google_counts_even_if_it_cannot_be_followed(monkeypatch):
+    # Google answers a deck saved as http:// with a redirect to https; if this network
+    # blocks that, the request still reached Google - so it is not asked again every
+    # 20 seconds, even while the screen is starting up.
+    import socket
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from app import net
+    net.reset_cache()
+    spare = socket.socket()
+    spare.bind(("127.0.0.1", 0))
+    dead = spare.getsockname()[1]
+    spare.close()                                       # nothing listens there now
+
+    class Google(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(301)
+            self.send_header("Location", f"http://127.0.0.1:{dead}/deck")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Google)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    deck = f"http://127.0.0.1:{server.server_address[1]}/deck"
+    try:
+        with pytest.raises(net._RedirectFailed):
+            net._fetch(deck)
+        fetches = []
+        real = net._fetch
+        monkeypatch.setattr(net, "_fetch", lambda u: (fetches.append(u), real(u))[1])
+        ok, why = net.probe(deck, now=1000.0, starting=True)
+        assert ok is False and "can't reach" in why
+        net.probe(deck, now=1000.0 + net.CACHE_SECONDS + 1, starting=True)
+        assert len(fetches) == 1                        # kept like an answer, not a miss
+        net.probe(deck, now=1000.0 + net.PROBE_CACHE_SECONDS + 1, starting=True)
+        assert net.quiet_for(deck, now=1000.0 + net.PROBE_CACHE_SECONDS + 2) > 0   # and it counts
+    finally:
+        server.shutdown()
+
+
+def test_a_failed_update_still_says_so_on_the_screen(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import discovery, server, updater
+    from app.server import create_app
+    monkeypatch.setattr(discovery, "advertise", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_seconds_since_power_on", lambda: 5000.0)
+    client = TestClient(create_app())
+    assert client.get("/api/screen-data").json()["startup_left"] == 0
+    monkeypatch.setattr(updater, "alert", lambda: "The update did not start; restored the previous version")
+    data = client.get("/api/screen-data").json()
+    assert data["startup_left"] == server.STARTUP_SCREEN and "restored" in data["update_alert"]
