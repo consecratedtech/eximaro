@@ -15,17 +15,20 @@ service to phone home to. Results are cached, and nothing is checked at all when
 playlist is entirely local, so an offline-only sign stays completely silent.
 """
 
+import ipaddress
 import socket
+import threading
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 # How long a verdict stands before it is looked up again. Long enough that a screen
 # polling every few seconds is not resolving on every tick; short enough that a
 # device notices the network coming back without anyone touching it.
 CACHE_SECONDS = 20
 RESOLVE_TIMEOUT = 2.0
+RESOLVE_WAIT = 5.0       # how long a poll waits on a lookup another poll already started
 
 _cache: dict = {}        # host -> (checked_at, reachable)
 
@@ -45,22 +48,73 @@ def _gate(key: str, now: float):
     return now < _quiet.get(key, 0)
 
 
+# Guards the failure records and the running-check list below. Polls are answered side
+# by side, so every change to them happens under it.
+_lock = threading.Lock()
+
+
 def _record(key: str, ok: bool, now: float) -> None:
-    """Track a run of failures; once it has lasted ACTIVE_WINDOW, go quiet."""
-    if ok:
-        _failing.pop(key, None)
-        _quiet.pop(key, None)
-        return
-    first = _failing.setdefault(key, now)
-    if now - first >= ACTIVE_WINDOW:
-        _quiet[key] = now + QUIET_PERIOD
-        _failing.pop(key, None)
+    """Track a run of failures; once it has lasted ACTIVE_WINDOW, go quiet. A run left
+    over from long ago (nothing was tried since) starts again rather than counting."""
+    with _lock:
+        if ok:
+            _failing.pop(key, None)
+            _quiet.pop(key, None)
+            return
+        first = _failing.get(key)
+        if first is None or now - first > ACTIVE_WINDOW + QUIET_PERIOD:
+            first = _failing[key] = now
+        if now - first >= ACTIVE_WINDOW:
+            _quiet[key] = now + QUIET_PERIOD
+            _failing.pop(key, None)
 
 
 def quiet_for(key: str, now: float = None) -> float:
     """Seconds left in a quiet period for this host/url, 0 if it is being checked."""
     now = time.time() if now is None else now
     return max(0.0, _quiet.get(key, 0) - now)
+
+
+# One check of a host or deck at a time. The screen polls every few seconds and the
+# server answers polls side by side, so without this a slow lookup or fetch would be
+# started again by the next poll before the first one finished.
+_checking: dict = {}     # key -> Event, set when the check running for that key ends
+
+
+def _begin(key: str):
+    """None if the caller should run the check itself, else the Event of the check
+    already running for `key`, to wait on instead."""
+    with _lock:
+        running = _checking.get(key)
+        if running is None:
+            _checking[key] = threading.Event()
+        return running
+
+
+def _end(key: str) -> None:
+    with _lock:
+        done = _checking.pop(key, None)
+    if done is not None:
+        done.set()
+
+
+_offline = {"since": None}   # when the device last lost its network address
+
+
+def _note_online(online: bool, now: float) -> None:
+    """Stop the two-minute clock while there is no network address. A run of failures
+    from before an outage carries on from where it was when the network comes back, so
+    the first failed try afterwards isn't taken as two minutes of trying - and a link
+    that keeps dropping still adds up its real trying time and goes quiet."""
+    with _lock:
+        if not online:
+            if _offline["since"] is None:
+                _offline["since"] = now
+            return
+        since, _offline["since"] = _offline["since"], None
+        if since is not None and now > since:
+            for key in list(_failing):
+                _failing[key] += now - since
 
 # A Google Slides deck can be *unreachable in a way DNS cannot see*: Google throttles
 # anonymous views of a busy published document by answering 401, or redirecting to a
@@ -82,15 +136,39 @@ def is_slides(url: str) -> bool:
     return "docs.google.com/presentation" in (url or "")
 
 
+def _to_sign_in(url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower()
+    return "accounts.google.com" in host or "/ServiceLogin" in url
+
+
+class _StopAtSignIn(urllib.request.HTTPRedirectHandler):
+    """Follows redirects as usual, except Google's redirect to its sign-in page: that
+    redirect IS the answer, so it is read rather than followed. Following it would turn
+    Google's refusal into an error wherever accounts.google.com is filtered (common on
+    church and school networks) - and an error is asked again much sooner."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if _to_sign_in(newurl):
+            return None          # urllib then raises HTTPError for this redirect
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(_StopAtSignIn)
+
+
 def _fetch(url: str):
     """(final_url, status) for a GET that follows redirects. Split out so tests can
     stand in for Google. Raises on network failure."""
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
     try:
-        with urllib.request.urlopen(req, timeout=PROBE_TIMEOUT) as resp:
+        with _opener.open(req, timeout=PROBE_TIMEOUT) as resp:
             return resp.geturl(), resp.status
     except urllib.error.HTTPError as e:
-        return e.geturl() or url, e.code
+        with e:
+            location = e.headers.get("Location") if e.headers else None
+            if 300 <= e.code < 400 and location:
+                return urljoin(url, location), e.code
+            return e.geturl() or url, e.code
 
 
 def _judge(final_url: str, status: int):
@@ -112,15 +190,44 @@ def probe(url: str, now: float = None):
         hit = _probe_cache.get(url)
         return False, (hit[2] if hit else "not checked again yet")
     hit = _probe_cache.get(url)
-    if hit and (now - hit[0]) < PROBE_CACHE_SECONDS:
+    if hit and (now - hit[0]) < hit[3]:
         return hit[1], hit[2]
+    running = _begin(url)
+    if running is not None:           # another poll is asking Google right now
+        if not hit:                   # nothing to go on yet: wait for its answer
+            running.wait(PROBE_TIMEOUT + 2)
+            hit = _probe_cache.get(url)
+        return (hit[1], hit[2]) if hit else (False, "checking the deck")
     try:
-        ok, reason = _judge(*_fetch(url))
-    except Exception as exc:          # DNS down, timeout, connection refused
-        ok, reason = False, f"could not reach Google ({type(exc).__name__})"
-    _probe_cache[url] = (now, ok, reason)
-    _record(url, ok, now)
-    return ok, reason
+        try:
+            ok, reason = _judge(*_fetch(url))
+            keep = PROBE_CACHE_SECONDS
+        except urllib.error.URLError as exc:
+            # The request never got to Google: the name didn't resolve, or no connection
+            # was made - the network isn't there yet, which is normal just after a boot.
+            # Ask again on the short cycle; the two-minutes-on, fifteen-off rule still
+            # decides how long it keeps trying.
+            why = exc.reason if isinstance(exc.reason, BaseException) else exc
+            ok, reason = False, f"could not reach Google ({type(why).__name__})"
+            keep = CACHE_SECONDS
+        except Exception as exc:
+            # Google had the request, but the answer was too slow or was cut off. That
+            # may have counted as a view, so it waits as long as an answer would.
+            ok, reason = False, f"Google didn't answer in time ({type(exc).__name__})"
+            keep = PROBE_CACHE_SECONDS
+        _probe_cache[url] = (now, ok, reason, keep)
+        _record(url, ok, now)
+        return ok, reason
+    finally:
+        _end(url)
+
+
+def last_probe(url: str):
+    """Google's last verdict on a deck as (ok, reason), or None if it hasn't been asked
+    yet - without asking. The panel uses this, so opening a page can never be what
+    makes the device load a deck: only the screen's own rate-limited checks do that."""
+    hit = _probe_cache.get(url)
+    return (hit[1], hit[2]) if hit else None
 
 
 def host_of(url: str) -> str:
@@ -154,10 +261,29 @@ def reachable(host: str, now: float = None) -> bool:
     hit = _cache.get(host)
     if hit and (now - hit[0]) < CACHE_SECONDS:
         return hit[1]
-    ok = _resolves(host)
-    _cache[host] = (now, ok)
-    _record(host, ok, now)
-    return ok
+    running = _begin(host)
+    if running is not None:           # another poll is looking it up right now
+        if not hit:                   # nothing to go on yet: wait for its answer
+            running.wait(RESOLVE_WAIT)
+            hit = _cache.get(host)
+        return hit[1] if hit else False
+    try:
+        ok = _resolves(host)
+        _cache[host] = (now, ok)
+        _record(host, ok, now)
+        return ok
+    finally:
+        _end(host)
+
+
+def _is_local(host: str) -> bool:
+    """A page this device serves itself needs no network to show."""
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def can_reach_all(urls, now: float = None) -> bool:
@@ -168,13 +294,22 @@ def can_reach_all(urls, now: float = None) -> bool:
     return not first_problem(urls, now)
 
 
-def first_problem(urls, now: float = None) -> str:
+def first_problem(urls, now: float = None, online: bool = True) -> str:
     """'' when everything is showable, else a short human reason for the first item
-    that isn't — this is what the screen's waiting card and the panel row show."""
+    that isn't — this is what the screen's waiting card and the panel row show.
+
+    `online` is False when the device has no network address at all - before the
+    router has answered after a power cut, say. Then there is nothing to ask, so
+    nothing is looked up, and the two-minute clock stands still until there is a
+    network to try again."""
+    now = time.time() if now is None else now
+    _note_online(online, now)
     for u in urls:
         h = host_of(u)
-        if not h:
+        if not h or _is_local(h):
             continue
+        if not online:
+            return "no network yet"
         if not reachable(h, now):
             return "no network yet"
         if is_slides(u):
@@ -188,5 +323,8 @@ def reset_cache() -> None:
     """Drop cached verdicts (tests, and after a network change)."""
     _cache.clear()
     _probe_cache.clear()
-    _failing.clear()
-    _quiet.clear()
+    with _lock:
+        _failing.clear()
+        _quiet.clear()
+        _checking.clear()
+        _offline["since"] = None

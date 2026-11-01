@@ -491,23 +491,23 @@ def create_app() -> FastAPI:
             creds = wifi.ap_credentials()
             setup = {"ssid": creds["ssid"], "password": creds["password"]}
         primary = addrs[0]["ip"] if addrs else None
+        # Whether the hosts this playlist needs are answering. A cross-origin iframe
+        # never reports that it failed, so without this the screen cannot tell a loaded
+        # deck from Chromium's offline error page — and paints the error page onto a
+        # public sign. Costs nothing on an all-local playlist: no remote hosts means no
+        # lookup at all, and with no network address there is nothing to look up.
+        remote = [i.get("src", "") for i in items if i.get("type") == "url"]
+        problem = net.first_problem(remote, online=discovery.has_address()) if remote else ""
         return {
             "items": items,
             # The code proves someone is standing at this screen, so only the screen
             # itself gets it - this route is open to the whole network.
             "pairing_code": pairing.current_code() if _from_this_device(request) else None,
             "shuffle": shuffle,
-            # Whether the hosts this playlist needs are answering. A cross-origin
-            # iframe never reports that it failed, so without this the screen cannot
-            # tell a loaded deck from Chromium's offline error page — and paints the
-            # error page onto a public sign. Costs nothing on an all-local playlist:
-            # no remote hosts means no lookup at all.
-            "content_reachable": not net.first_problem(
-                [i.get("src", "") for i in items if i.get("type") == "url"]),
+            "content_reachable": not problem,
             # The reason, when there is one, so the waiting card can say "Google is
             # asking viewers to sign in" rather than blaming the network.
-            "content_note": net.first_problem(
-                [i.get("src", "") for i in items if i.get("type") == "url"]),
+            "content_note": problem,
             # Shown ONLY on the boot splash (never over playing content): a failed
             # update should be visible to whoever walks past a rebooted screen.
             "update_alert": updater.alert(),
@@ -2512,14 +2512,16 @@ def _content_body(cfg: dict, displays=None) -> str:
             elif is_slides_raw:
                 # If Google is refusing anonymous viewers, say so — that is the actual
                 # reason the length could not be read, and nothing on the device fixes it.
-                _ok, _why = net.probe(it.get("ref", ""))
+                # Only the last verdict is read: a page view never asks Google itself.
+                _ok, _why = net.last_probe(it.get("ref", "")) or (True, "")
                 if not _ok and "sign in" in _why:
                     note = (f'<span class="slidenote">&#9654; Google Slides &mdash; {_esc(_why)}. '
                             'Check File &rarr; Share &rarr; Publish to web, and that your Google '
                             'account allows publishing to anyone</span>')
                 else:
                     note = ('<span class="slidenote">&#9654; Google Slides &mdash; haven\'t read its '
-                            'length yet; re-check while online, or set the seconds by hand</span>')
+                            'length yet; re-check while online, or set the seconds by hand. If it '
+                            'never reads, check File &rarr; Share &rarr; Publish to web</span>')
                 secs_html = (f"""
                 <form class="secs" method="post" action="/api/content/remeasure"
                       title="Read the deck length now (needs to be online)">

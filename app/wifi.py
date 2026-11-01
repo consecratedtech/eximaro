@@ -67,7 +67,7 @@ def join_qr_payload() -> str:
 
 # NetworkManager's shared (hotspot) mode always puts the Pi at this gateway address
 # on the setup network, so the setup page is reachable there once a phone has joined.
-AP_GATEWAY = "10.42.0.1"
+AP_GATEWAY = discovery.AP_GATEWAY
 
 
 def setup_page_url() -> str:

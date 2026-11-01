@@ -86,11 +86,36 @@ def labeled_ips() -> list:
 # NetworkManager hands its hotspot the 10.42.x range. An address there means we're
 # *hosting* the setup network, not connected to a real one — so it doesn't count.
 AP_SUBNET = "10.42."
+AP_GATEWAY = "10.42.0.1"   # this device's own address on the setup network it hosts
 
 
 def hosting_ap() -> bool:
     """True while this device is hosting its own WiFi setup network."""
     return any(e["ip"].startswith(AP_SUBNET) for e in labeled_ips())
+
+
+def has_address() -> bool:
+    """Does this device have a real network address, of either IP version? Loopback,
+    link-local, virtual interfaces (they keep an address with no network behind them)
+    and our own setup network's gateway don't count. False means nothing can be reached
+    yet - a Pi that booted before its router, say - so there is nothing to try. If it
+    can't tell (no iproute2), it says yes, so no check is ever skipped by mistake."""
+    try:
+        res = subprocess.run(["ip", "-o", "addr", "show", "scope", "global"],
+                             capture_output=True, text=True, timeout=2)
+    except Exception:
+        return True
+    if res.returncode != 0:
+        return True
+    for line in res.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 4 or "dadfailed" in parts:
+            continue
+        iface = parts[1].split("@")[0]
+        if iface.startswith(_SKIP_IFACES) or parts[3].startswith(AP_GATEWAY + "/"):
+            continue
+        return True
+    return False
 
 
 def real_ips() -> list:

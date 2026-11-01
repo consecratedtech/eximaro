@@ -184,10 +184,16 @@ def test_probe_reads_googles_answer(monkeypatch):
     ok, why = net.probe(deck)
     assert ok is False and "sign in" in why
     net.reset_cache()
-    def boom(u): raise TimeoutError()
-    monkeypatch.setattr(net, "_fetch", boom)
+    import urllib.error
+    def never_sent(u): raise urllib.error.URLError(TimeoutError())   # no connection made
+    monkeypatch.setattr(net, "_fetch", never_sent)
     ok, why = net.probe(deck)
     assert ok is False and "could not reach" in why
+    net.reset_cache()
+    def too_slow(u): raise TimeoutError()                           # sent, answer too slow
+    monkeypatch.setattr(net, "_fetch", too_slow)
+    ok, why = net.probe(deck)
+    assert ok is False and "didn't answer in time" in why
 
 
 def test_probe_is_cached_so_it_cannot_become_a_load_source(monkeypatch):
@@ -260,3 +266,277 @@ def test_google_probe_respects_the_quiet_period_too(monkeypatch):
     ok, why = net.probe(deck, now=net.PROBE_CACHE_SECONDS + 2)
     assert ok is False and "sign in" in why               # the last reason is still shown
     assert len(calls) == 2                                # and Google was not asked again
+
+
+# --- after a power cut the deck comes back as soon as the network does -----------------
+
+import threading  # noqa: E402
+import time  # noqa: E402
+import urllib.error  # noqa: E402
+
+DECK = "https://docs.google.com/presentation/d/e/2PACX-boot/embed"
+
+
+def test_with_no_network_address_nothing_is_looked_up_or_counted(monkeypatch):
+    from app import net
+    net.reset_cache()
+    calls = []
+    monkeypatch.setattr(net, "_resolves", lambda h: (calls.append(h), False)[1])
+    for s in range(0, 600, 3):                       # ten minutes of screen polls, no network
+        assert net.first_problem([DECK], now=1000.0 + s, online=False) == "no network yet"
+    assert calls == [] and net.quiet_for("docs.google.com", now=1600.0) == 0
+
+
+def test_the_deck_shows_on_the_first_poll_once_there_is_a_network(monkeypatch):
+    # The Pi boots before the router: nothing was counted while it had no address, so
+    # the first poll with one checks straight away.
+    from app import net
+    net.reset_cache()
+    monkeypatch.setattr(net, "_resolves", lambda h: True)
+    monkeypatch.setattr(net, "_fetch", lambda u: (u, 200))
+    for s in range(0, 300, 3):
+        net.first_problem([DECK], now=1000.0 + s, online=False)
+    assert net.first_problem([DECK], now=1300.0, online=True) == ""
+
+
+def test_a_flapping_link_still_goes_quiet(monkeypatch):
+    # Wi-Fi drops and rejoins every minute while the internet is down: the owner's rule
+    # (about two minutes of tries, then fifteen quiet) must still hold.
+    from app import net
+    net.reset_cache()
+    calls = []
+    monkeypatch.setattr(net, "_resolves", lambda h: (calls.append(h), False)[1])
+    went_quiet = False
+    for s in range(0, 3600, 3):
+        online = (s // 60) % 2 == 0
+        net.first_problem([DECK], now=10000.0 + s, online=online)
+        went_quiet = went_quiet or net.quiet_for("docs.google.com", now=10000.0 + s) > 0
+    assert went_quiet
+    assert len(calls) <= 30                          # a steady network would make about 28
+
+
+def test_a_page_on_the_device_itself_needs_no_network():
+    from app import net
+    net.reset_cache()
+    for local in ("http://localhost:8080/menu", "http://127.0.0.1/board", "http://[::1]:9000/x"):
+        assert net.first_problem([local], online=False) == ""
+
+
+def test_only_a_request_that_never_left_is_asked_again_soon(monkeypatch):
+    from http.client import RemoteDisconnected
+    from app import net
+    for exc, keep in ((urllib.error.URLError(ConnectionRefusedError()), net.CACHE_SECONDS),
+                      (TimeoutError(), net.PROBE_CACHE_SECONDS),
+                      (RemoteDisconnected("cut off"), net.PROBE_CACHE_SECONDS)):
+        net.reset_cache()
+        calls = []
+
+        def fetch(u, exc=exc):
+            calls.append(u)
+            raise exc
+        monkeypatch.setattr(net, "_fetch", fetch)
+        net.probe(DECK, now=1000.0)
+        net.probe(DECK, now=1000.0 + keep - 1)
+        assert len(calls) == 1, exc                  # still the first verdict
+        net.probe(DECK, now=1000.0 + keep + 1)
+        assert len(calls) == 2, exc
+
+
+def test_googles_sign_in_redirect_is_read_not_followed():
+    # A throttled deck is answered with a redirect to Google's sign-in page. That is the
+    # verdict; following it would turn it into an error where accounts.google.com is
+    # filtered. A local server stands in for Google.
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from app import net
+
+    class Google(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.startswith("/throttled"):
+                self.send_response(302)
+                self.send_header("Location", "https://accounts.google.com/ServiceLogin?continue=x")
+            elif self.path.startswith("/moved"):
+                self.send_response(302)
+                self.send_header("Location", "/deck")
+            else:
+                self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Google)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        url, status = net._fetch(base + "/throttled")
+        assert status == 302 and "accounts.google.com" in url
+        assert "sign in" in net._judge(url, status)[1]
+        assert net._fetch(base + "/moved") == (base + "/deck", 200)   # other redirects still followed
+    finally:
+        server.shutdown()
+
+
+def test_two_polls_at_once_ask_google_once(monkeypatch):
+    # A poll that arrives while another is asking waits for that answer instead of
+    # starting a second request - or reporting the deck unreachable in the meantime.
+    from app import net
+    net.reset_cache()
+    calls, gate, answers = [], threading.Event(), []
+
+    def slow(u):
+        calls.append(u)
+        gate.wait(5)
+        return u, 200
+    monkeypatch.setattr(net, "_fetch", slow)
+    first = threading.Thread(target=lambda: answers.append(net.probe(DECK)))
+    first.start()
+    for _ in range(500):
+        if calls:
+            break
+        time.sleep(0.01)
+    second = threading.Thread(target=lambda: answers.append(net.probe(DECK)))
+    second.start()
+    time.sleep(0.2)
+    gate.set()
+    first.join()
+    second.join()
+    assert len(calls) == 1
+    assert answers == [(True, ""), (True, "")]
+
+
+def test_a_poll_during_a_recheck_keeps_the_last_answer(monkeypatch):
+    # While a fifteen-minute recheck is running, other polls get the previous verdict
+    # straight away, so a deck that is playing is never taken off the screen.
+    from app import net
+    net.reset_cache()
+    gate = threading.Event()
+    net._probe_cache[DECK] = (0.0, True, "", net.PROBE_CACHE_SECONDS)       # long expired
+    monkeypatch.setattr(net, "_fetch", lambda u: (gate.wait(5), (u, 200))[1])
+    first = threading.Thread(target=net.probe, args=(DECK,))
+    first.start()
+    time.sleep(0.2)
+    began = time.monotonic()
+    assert net.probe(DECK) == (True, "")
+    assert time.monotonic() - began < 1
+    gate.set()
+    first.join()
+
+
+def test_opening_the_panel_never_asks_google(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import discovery, library, net
+    from app.server import create_app
+    net.reset_cache()
+    monkeypatch.setattr(discovery, "advertise", lambda *a, **k: None)
+    fetches = []
+    monkeypatch.setattr(net, "_fetch", lambda u: (fetches.append(u), (u, 401))[1])
+    cfg = config.load_config()
+    cfg["role"] = "controller"
+    config.save_config(cfg)
+    library.add_url(DECK, 30)
+    monkeypatch.setattr(library, "MEASURE_GRACE", -1)   # its length-reading has finished (unread)
+    client = TestClient(create_app())
+    page = client.get("/content").text
+    assert "Google Slides" in page and "Publish to web" in page    # says where to look anyway
+    assert fetches == []
+    ref = library.list_items()[0]["ref"]              # the link as stored (and as the screen asks)
+    net._probe_cache[ref] = (time.time(), False, "Google is asking viewers to sign in for this deck",
+                             net.PROBE_CACHE_SECONDS)
+    assert "asking viewers to sign in" in client.get("/content").text   # the screen's verdict is shown
+    assert fetches == []
+
+
+def test_screen_data_asks_once_per_poll_and_not_at_all_with_no_address(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import discovery, library, net
+    from app.server import create_app
+    net.reset_cache()
+    monkeypatch.setattr(discovery, "advertise", lambda *a, **k: None)
+    cfg = config.load_config()
+    cfg["role"] = "display"
+    config.save_config(cfg)
+    library.add_url(DECK, 30)
+    resolves, fetches = [], []
+    monkeypatch.setattr(net, "_resolves", lambda h: (resolves.append(h), True)[1])
+    monkeypatch.setattr(net, "_fetch", lambda u: (fetches.append(u), (u, 200))[1])
+    client = TestClient(create_app())
+    monkeypatch.setattr(discovery, "has_address", lambda: False)
+    data = client.get("/api/screen-data").json()
+    assert data["content_reachable"] is False and data["content_note"] == "no network yet"
+    assert resolves == [] and fetches == []
+    monkeypatch.setattr(discovery, "has_address", lambda: True)
+    data = client.get("/api/screen-data").json()
+    assert data["content_reachable"] is True and data["content_note"] == ""
+    assert len(resolves) == 1 and len(fetches) == 1
+
+
+def test_has_address_reads_ip_and_never_guesses_offline(monkeypatch):
+    import subprocess
+    from app import discovery
+
+    def ip(out, code=0):
+        return lambda *a, **k: subprocess.CompletedProcess(a, code, out, "")
+    monkeypatch.setattr(discovery.subprocess, "run", ip(""))
+    assert discovery.has_address() is False                         # nothing yet
+    monkeypatch.setattr(discovery.subprocess, "run",
+                        ip("3: wlan0    inet6 2001:db8::5/64 scope global dynamic\n"))
+    assert discovery.has_address() is True                          # IPv6 counts
+    monkeypatch.setattr(discovery.subprocess, "run",
+                        ip("1: lo    inet 10.42.0.1/32 scope global lo\n"))
+    assert discovery.has_address() is False                         # loopback doesn't
+    monkeypatch.setattr(discovery.subprocess, "run", ip("", code=1))
+    assert discovery.has_address() is True                          # can't tell -> check
+
+    def missing(*a, **k):
+        raise FileNotFoundError("ip")
+    monkeypatch.setattr(discovery.subprocess, "run", missing)
+    assert discovery.has_address() is True
+
+
+def test_an_outage_pauses_the_two_minute_clock(monkeypatch):
+    # A failure just before the network drops must not make the first failed try after
+    # it count as two minutes of trying: the device keeps trying for real first.
+    from app import net
+    net.reset_cache()
+    calls = []
+    monkeypatch.setattr(net, "_resolves", lambda h: (calls.append(h), False)[1])
+    net.first_problem([DECK], now=1000.0, online=True)                       # one failure
+    for s in range(5, 600, 3):
+        net.first_problem([DECK], now=1000.0 + s, online=False)               # ten minutes without
+    net.first_problem([DECK], now=1600.0, online=True)                       # back, still failing
+    assert net.quiet_for("docs.google.com", now=1600.0) == 0                 # still trying
+    for s in range(1, 200, 3):
+        net.first_problem([DECK], now=1600.0 + s, online=True)
+    assert net.quiet_for("docs.google.com", now=1800.0) > 0                  # then goes quiet
+    assert 6 <= len(calls) <= 9
+
+
+def test_has_address_ignores_interfaces_with_no_network_behind_them(monkeypatch):
+    import subprocess
+    from app import discovery
+
+    def ip(out):
+        return lambda *a, **k: subprocess.CompletedProcess(a, 0, out, "")
+    for only in ("4: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\n",
+                 "5: tailscale0    inet 100.101.102.103/32 scope global tailscale0\n",
+                 "3: wlan0    inet 10.42.0.1/24 brd 10.42.0.255 scope global noprefixroute wlan0\n",
+                 "2: eth0    inet6 2001:db8::7/64 scope global dadfailed tentative\n"):
+        monkeypatch.setattr(discovery.subprocess, "run", ip(only))
+        assert discovery.has_address() is False, only
+    monkeypatch.setattr(discovery.subprocess, "run",
+                        ip("3: wlan0    inet 10.42.0.23/24 brd 10.42.0.255 scope global dynamic wlan0\n"))
+    assert discovery.has_address() is True          # a real network that uses 10.42 still counts
+    monkeypatch.setattr(discovery.subprocess, "run",
+                        ip("2: end0    inet 192.0.2.10/24 brd 192.0.2.255 scope global dynamic end0\n"))
+    assert discovery.has_address() is True
+
+
+def test_a_run_left_over_from_long_ago_starts_again(monkeypatch):
+    # A deck taken out of the playlist hours ago, then put back: its old failure must not
+    # make the first new failure go straight into the fifteen-minute wait.
+    from app import net
+    net.reset_cache()
+    monkeypatch.setattr(net, "_resolves", lambda h: False)
+    net.reachable("docs.google.com", now=1000.0)
+    net.reachable("docs.google.com", now=1000.0 + 3 * 3600)
+    assert net.quiet_for("docs.google.com", now=1000.0 + 3 * 3600) == 0
