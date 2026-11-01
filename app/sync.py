@@ -27,6 +27,14 @@ def canon(manifest: dict) -> bytes:
     return json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
 
 
+def web_url(value) -> bool:
+    """Is this an ordinary http(s) link? A push may only bring those: a javascript:
+    link would run code inside the screen's own page, and a file: one would copy
+    files off this device into its open asset folder."""
+    return (isinstance(value, str) and value.lower().startswith(("http://", "https://"))
+            and not any(ord(c) < 32 or ord(c) == 127 for c in value))
+
+
 def post_json(url: str, obj: dict, timeout: int = 10) -> dict:
     data = json.dumps(obj).encode()
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
@@ -238,6 +246,8 @@ def receive(manifest: dict, signature: str, controller_site_key: str) -> bool:
     items = []
     for it in manifest.get("items", []):
         if it.get("type") == "url":
+            if not web_url(it.get("url")):
+                continue
             entry = {"type": "url", "src": it["url"], "seconds": it["seconds"]}
             if it.get("youtube"):
                 entry["youtube"] = True
@@ -247,6 +257,8 @@ def receive(manifest: dict, signature: str, controller_site_key: str) -> bool:
         elif it.get("type") == "slideshow":
             srcs = []
             for asset_url in it.get("asset_urls", []):
+                if not web_url(asset_url):
+                    continue
                 name = hashlib.sha256(asset_url.encode()).hexdigest()[:16] + ".img"
                 try:
                     _download(asset_url, RECV_ASSETS / name)
@@ -256,6 +268,8 @@ def receive(manifest: dict, signature: str, controller_site_key: str) -> bool:
             if srcs:
                 items.append({"type": "slideshow", "srcs": srcs, "seconds": it["seconds"]})
         elif it.get("type") == "video":
+            if not web_url(it.get("url") or it.get("asset_url")):
+                continue
             if it.get("url"):
                 entry = {"type": "video", "src": it["url"], "seconds": it["seconds"]}
             elif it.get("asset_url"):
@@ -272,6 +286,8 @@ def receive(manifest: dict, signature: str, controller_site_key: str) -> bool:
                 entry["sound"] = True
             items.append(entry)
         else:
+            if not web_url(it.get("asset_url")):
+                continue
             name = hashlib.sha256(it["asset_url"].encode()).hexdigest()[:16] + ".img"
             try:
                 urllib.request.urlretrieve(it["asset_url"], str(RECV_ASSETS / name))

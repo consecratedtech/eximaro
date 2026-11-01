@@ -428,7 +428,10 @@ def create_app() -> FastAPI:
         # that setting belongs to the playlist, not to the screen showing it.
         shuffle = bool(cfg.get("shuffle"))
         if pushed is not None:
-            items = pushed
+            # Only a web link may become a page on the screen: a javascript: one would
+            # run inside the screen's own page. New pushes are checked on arrival; this
+            # also covers a playlist that arrived before that check existed.
+            items = [i for i in pushed if i.get("type") != "url" or sync.web_url(i.get("src"))]
             shuffle = sync.screen_shuffle()
         elif show_here:
             items = []

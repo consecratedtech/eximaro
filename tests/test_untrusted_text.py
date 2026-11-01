@@ -89,3 +89,52 @@ def test_pairing_keeps_only_a_text_name(monkeypatch):
                         lambda *a, **k: _Reply({"device_id": "aaaa1111", "name": ["Lobby"]}))
     record = pairing.claim_display("192.0.2.8", 8080, "ABCD2345", {"device_id": "c0ffee00"})
     assert record["device_id"] == "aaaa1111" and record["name"] == ""
+
+
+# --- what a push may put on the screen ---------------------------------------------
+
+KEY = "ab" * 32
+
+
+def _push(items):
+    from app import commands, sync
+    manifest = {"items": items, "from": "eximaro-c0ffee", "shuffle": False}
+    return sync.receive(manifest, commands.sign(KEY, sync.canon(manifest)), KEY)
+
+
+@pytest.mark.parametrize("bad", [
+    "javascript:fetch('/api/password/clear')",
+    "JavaScript:alert(1)",
+    " javascript:alert(1)",
+    "java\tscript:alert(1)",
+    "data:text/html,<script>alert(1)</script>",
+    "file:///etc/passwd",
+])
+def test_a_push_brings_only_web_links(bad):
+    from app import sync
+    assert _push([{"type": "url", "url": bad, "seconds": 10},
+                  {"type": "url", "url": "https://example.com/", "seconds": 10}])
+    assert [i["src"] for i in sync.screen_items()] == ["https://example.com/"]
+
+
+def test_a_push_never_copies_a_local_file(monkeypatch):
+    from app import sync
+    fetched = []
+    monkeypatch.setattr(sync.urllib.request, "urlretrieve", lambda url, dest: fetched.append(url))
+    monkeypatch.setattr(sync, "_download", lambda url, dest: fetched.append(url))
+    assert _push([{"type": "image", "asset_url": "file:///var/lib/eximaro/config.json", "seconds": 5},
+                  {"type": "slideshow", "asset_urls": ["file:///etc/shadow"], "seconds": 5},
+                  {"type": "video", "asset_url": "file:///etc/hostname", "seconds": 5}])
+    assert fetched == [] and sync.screen_items() == []
+
+
+def test_the_screen_never_gets_a_script_link_that_arrived_earlier():
+    # A playlist saved before pushes were checked on arrival.
+    from app import pairing, sync
+    pairing.set_controller({"device_id": "c0ffee00", "name": "eximaro-c0ffee",
+                            "address": "192.0.2.5", "site_key": KEY})
+    sync._save({"items": [{"type": "url", "src": "javascript:alert(1)", "seconds": 10},
+                          {"type": "url", "src": "https://example.com/", "seconds": 10}],
+                "shuffle": False})
+    data = _client(role="display").get("/api/screen-data").json()
+    assert [i["src"] for i in data["items"]] == ["https://example.com/"]
