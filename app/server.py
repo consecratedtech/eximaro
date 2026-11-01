@@ -174,7 +174,7 @@ def create_app() -> FastAPI:
     # once a password is set - otherwise anyone there could move the screen to another
     # network, or knock it off this one.
     _SETUP_NETWORK_OPEN = {"/wifi-setup", "/wifi-qr.png", "/wifi-open-qr.png",
-                           "/api/wifi/connect", "/api/wifi/stop"}
+                           "/api/wifi/connect"}
     # The TV itself shows the two setup QR codes while it hosts that network.
     _SCREEN_OPEN = {"/wifi-qr.png", "/wifi-open-qr.png"}
     _login_fails = {}  # client ip -> (count, window_start): basic brute-force throttle
@@ -574,7 +574,7 @@ def create_app() -> FastAPI:
         except Exception:
             return Response(status_code=404)
 
-    def _wifi_setup_html(creds, st, nets):
+    def _wifi_setup_html(creds, st, nets, on_setup_network=False):
         options = "".join(f'<option value="{_esc(n["ssid"])}">' for n in nets if n.get("ssid"))
         if st.get("ssid") and not st.get("ap_active"):
             banner = f'<p class="ok">&#10003; Connected to <b>{_esc(st["ssid"])}</b>.</p>'
@@ -589,35 +589,19 @@ def create_app() -> FastAPI:
         # all, into it), and this page can be open to anyone on the network.
         err = ('<p class="err">Couldn&rsquo;t connect to that network. Check its name '
                'and password, then try again.</p>') if st.get("error") else ""
-        # Only offer to take the setup network down when one is actually running.
+        # On the setup network, say what Connect does before it happens: the network the
+        # phone is on goes away while the screen joins, which looks like a failure if
+        # nobody said so.
+        next_html = ('<p class="note">When you tap Connect, this setup network goes away '
+                     'while the screen joins yours, and your phone drops off it. If the screen '
+                     'can&rsquo;t join, the setup network comes back within a minute so you can '
+                     'try again.</p>') if on_setup_network else ""
+        # Only offer to take the setup network down when one is running, and only from the
+        # normal network: from a phone ON the setup network it would just cut that phone off.
         stop_html = ('<form method="post" action="/api/wifi/stop">'
                      '<button class="stop">Stop setup network</button></form>'
-                     if st.get("ap_active") else "")
-        return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WiFi setup · eximaro</title>
-<style>
-/* Fully self-contained — no external CSS, web fonts, or favicon. This page is
-   served on the setup network, which has NO internet, so it must render from a
-   single request; anything the browser has to download separately can hang and
-   leave the page blank. System fonts + inline colors keep it instant. */
-body{{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;max-width:520px;margin:0 auto;
-  padding:28px 22px;background:#F8F9FA;color:#17191C;-webkit-font-smoothing:antialiased}}
-.wm{{font-weight:700;font-size:1.2rem;letter-spacing:-.01em;margin-bottom:18px}}
-.wm .x{{color:#2F7FE0}}
-h1{{font-weight:700;font-size:1.4rem;letter-spacing:-.01em;margin:0 0 12px}}
-h2{{font-weight:700;font-size:1.05rem;margin:22px 0 6px}}
-label{{font-weight:600;font-size:.85rem;color:#5E646B;display:block;margin-top:8px}}
-input,button{{font:inherit;padding:12px;width:100%;box-sizing:border-box;margin:6px 0;border-radius:10px;
-  border:1.5px solid #E6E8EA;background:#fff;color:#17191C}}
-input:focus{{outline:none;border-color:#2F7FE0;box-shadow:0 0 0 3px #E3F0FC}}
-button{{background:#17191C;color:#fff;font-weight:600;border:0;cursor:pointer;margin-top:10px}}
-.stop{{background:#fff;color:#5E646B;border:1px solid #E6E8EA}}
-.ok{{color:#1E7A4E;font-weight:600}}.err{{color:#C93B3B;font-weight:600}}
-img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px solid #E6E8EA}}
-</style></head><body>
-<div class="wm">e<span class="x">x</span>imaro</div>
-<h1>Connect this screen to WiFi</h1>
+                     if st.get("ap_active") and not on_setup_network else "")
+        return _wifi_shell("WiFi setup", f"""<h1>Connect this screen to WiFi</h1>
 {banner}{err}
 <h2>Share your WiFi</h2>
 <form method="post" action="/api/wifi/connect">
@@ -628,12 +612,13 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
   <input name="password" type="password" placeholder="WiFi password">
   <button type="submit">Connect</button>
 </form>
-{stop_html}
-</body></html>"""
+{next_html}
+{stop_html}""")
 
     @app.get("/wifi-setup", response_class=HTMLResponse)
-    def wifi_setup():
-        return HTMLResponse(_wifi_setup_html(wifi.ap_credentials(), wifi.status(), wifi.scan()))
+    def wifi_setup(request: Request):
+        return HTMLResponse(_wifi_setup_html(wifi.ap_credentials(), wifi.status(), wifi.scan(),
+                                             on_setup_network=_via_setup_network(request)))
 
     @app.post("/api/wifi/start")
     def wifi_start():
@@ -644,9 +629,19 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
         return RedirectResponse("/wifi-setup", status_code=303)
 
     @app.post("/api/wifi/connect")
-    def wifi_connect(ssid: str = Form(...), password: str = Form("")):
-        wifi.request_connect(ssid.strip(), password)
-        activity.log("Joining a WiFi network", ssid.strip())
+    def wifi_connect(request: Request, ssid: str = Form(...), password: str = Form(""),
+                     confirm: str = Form("")):
+        ssid = ssid.strip()
+        if not ssid:
+            return RedirectResponse("/wifi-setup", status_code=303)
+        # Joining from the screen's own setup network IS the setup: there is no other
+        # network to lose. From the normal network it can take the screen off the very
+        # network this page is open on, so that gets a screen first - sent as this POST's
+        # answer, never a redirect, so the password never ends up in an address.
+        if confirm != "yes" and not _via_setup_network(request):
+            return _wifi_move_screen(current(), ssid, password)
+        wifi.request_connect(ssid, password)
+        activity.log("Joining a WiFi network", ssid)
         return RedirectResponse("/wifi-setup", status_code=303)
 
     @app.post("/api/wifi/stop")
@@ -2186,6 +2181,95 @@ def _page(title: str, role: str, cfg: dict, body: str, active: str = "home") -> 
   {_SETTINGS_JS}
 </body></html>"""
     return HTMLResponse(html)
+
+
+# Wi-Fi pages are served on the setup network too, which has NO internet, so each one
+# is fully self-contained: no external CSS, web fonts or favicon. Anything the browser
+# has to fetch separately can hang there and leave the page blank. System fonts and
+# inline colours keep it to a single request.
+_WIFI_STYLE = """
+body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;max-width:520px;margin:0 auto;
+  padding:28px 22px;background:#F8F9FA;color:#17191C;-webkit-font-smoothing:antialiased;overflow-wrap:anywhere}
+.wm{font-weight:700;font-size:1.2rem;letter-spacing:-.01em;margin-bottom:18px}
+.wm .x{color:#2F7FE0}
+h1{font-weight:700;font-size:1.4rem;letter-spacing:-.01em;margin:0 0 12px}
+h2{font-weight:700;font-size:1.05rem;margin:22px 0 6px}
+label{font-weight:600;font-size:.85rem;color:#5E646B;display:block;margin-top:8px}
+input,button{font:inherit;padding:12px;width:100%;box-sizing:border-box;margin:6px 0;border-radius:10px;
+  border:1.5px solid #E6E8EA;background:#fff;color:#17191C}
+input:focus{outline:none;border-color:#2F7FE0;box-shadow:0 0 0 3px #E3F0FC}
+button{background:#17191C;color:#fff;font-weight:600;border:0;cursor:pointer;margin-top:10px}
+.stop{background:#fff;color:#5E646B;border:1px solid #E6E8EA}
+.danger{background:#fff;color:#C93B3B;border:1.5px solid #C93B3B}
+.ok{color:#1E7A4E;font-weight:600}.err{color:#C93B3B;font-weight:600}
+.note{color:#5E646B;font-size:.92rem}
+ul{padding-left:20px;color:#3A3F45}li{margin:7px 0}
+img{background:#fff;padding:8px;border-radius:12px;display:block;border:1px solid #E6E8EA}
+"""
+
+
+def _wifi_shell(title: str, body: str) -> str:
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title} · eximaro</title>
+<style>{_WIFI_STYLE}</style></head><body>
+<div class="wm">e<span class="x">x</span>imaro</div>
+{body}
+</body></html>"""
+
+
+def _wifi_move_screen(cfg: dict, ssid: str, password: str) -> HTMLResponse:
+    """The screen before sending a device to a Wi-Fi network from the normal network.
+
+    It says only what is certain: a device without a cable leaves the network it is on
+    at once (so this page stops answering), and a network cable gets it back. Whether a
+    failed join finds its way back by itself depends on the networks around it, so the
+    screen doesn't promise it."""
+    name, new = _esc(cfg["name"]), _esc(ssid)
+    real = [a for a in discovery.labeled_ips() if not a["ip"].startswith(discovery.AP_SUBNET)]
+    wired = any(a["label"] == "Ethernet" for a in real)
+    on_wifi = any(a["label"] == "Wi-Fi" for a in real)
+    current_ssid = wifi.status().get("ssid") if on_wifi else None
+    if wired:
+        title, lead = f"Connect {name} to {new}?", "If you continue:"
+        bullets = ["It stays on its network cable as well, so nothing it&rsquo;s doing now stops.",
+                   f"If the name or password is wrong, it simply won&rsquo;t join {new}."]
+        keep, yes, yes_class = "Cancel", f"Yes, connect to {new}", "stop"
+    else:
+        cur = f"<b>{_esc(current_ssid)}</b>" if current_ssid else "the network it&rsquo;s on now"
+        title = f"Move {name} to {new}?"
+        lead = "Check the network name and password first. If you continue:"
+        bullets = [f"{name} leaves {cur} right away, and this page stops answering here.",
+                   f"Once it&rsquo;s on {new}, open its page from a phone or computer on {new}.",
+                   f"If it can&rsquo;t join {new} &mdash; a wrong password, or out of range &mdash; "
+                   f"it may not be reachable until it&rsquo;s back on {cur}. Plugging in a "
+                   "network cable brings it back."]
+        # A controller reaches its displays over the network they share.
+        role = cfg.get("role")
+        controller = pairing.get_controller() if role == "display" else None
+        displays = pairing.list_displays() if role == "controller" else []
+        if controller:
+            ctl = _esc(controller.get("name") or "Its controller")
+            bullets.append(f"{ctl} can only send it content while they&rsquo;re on the same network.")
+        elif displays:
+            verb = "gets" if len(displays) == 1 else "get"
+            bullets.append(f"{_names(_display_names(displays))} only {verb} content while "
+                           "on the same network as this controller.")
+        keep = f"Keep it on {_esc(current_ssid)}" if current_ssid else "Keep it where it is"
+        yes, yes_class = f"Yes, move it to {new}", "danger"
+    points = "".join(f"<li>{b}</li>" for b in bullets)
+    body = f"""<h1>{title}</h1>
+<p>{lead}</p>
+<ul>{points}</ul>
+<form method="get" action="/"><button type="submit">{keep}</button></form>
+<form method="post" action="/api/wifi/connect">
+  <input type="hidden" name="confirm" value="yes">
+  <input type="hidden" name="ssid" value="{new}">
+  <input type="hidden" name="password" value="{_esc(password)}">
+  <button class="{yes_class}" type="submit">{yes}</button>
+</form>"""
+    # The password rides along in the yes form, so this page must never be kept.
+    return HTMLResponse(_wifi_shell("WiFi setup", body), headers={"Cache-Control": "no-store"})
 
 
 def _from_this_device(request: Request) -> bool:

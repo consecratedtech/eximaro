@@ -103,3 +103,99 @@ def test_with_no_password_nothing_changes(monkeypatch):
     _client(role="display")
     client = TestClient(create_app(), client=LAN)
     assert client.get("/wifi-setup").status_code == 200
+
+
+# --- moving a screen to another network from the normal network ----------------------
+
+WIFI_NOW = [{"ip": "192.0.2.10", "iface": "wlan0", "wifi": True, "label": "Wi-Fi"}]
+WIRED = [{"ip": "192.0.2.10", "iface": "eth0", "wifi": False, "label": "Ethernet"}]
+
+
+def _on(monkeypatch, addrs, ssid="Home Net"):
+    monkeypatch.setattr(discovery, "labeled_ips", lambda: addrs)
+    monkeypatch.setattr(discovery, "hosting_ap", lambda: False)
+    wifi.STATUS_PATH.write_text(json.dumps({"wifi": "connected", "ssid": ssid}))
+
+
+def test_moving_a_wifi_only_screen_needs_the_screen_first(monkeypatch):
+    _on(monkeypatch, WIFI_NOW)
+    client = TestClient(_client(role="display", name="Lobby").app, client=LAN)
+    r = client.post("/api/wifi/connect", data={"ssid": "Office", "password": "pw123456"},
+                    follow_redirects=False)
+    assert r.status_code == 200 and not wifi.pending()           # nothing asked of the helper yet
+    page = r.text
+    assert "Move Lobby to Office?" in page
+    assert "Lobby leaves <b>Home Net</b> right away" in page and "network cable brings it back" in page
+    assert "Keep it on Home Net" in page
+    assert page.index('<form method="get" action="/">') < page.index('name="confirm" value="yes"')
+    assert r.headers["cache-control"] == "no-store"              # the password is in the yes form
+
+
+def test_the_explicit_yes_moves_it(monkeypatch):
+    _on(monkeypatch, WIFI_NOW)
+    client = TestClient(_client(role="display").app, client=LAN)
+    r = client.post("/api/wifi/connect", data={"ssid": "Office", "password": "pw123456", "confirm": "yes"},
+                    follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/wifi-setup"
+    assert json.loads(wifi.REQUEST_PATH.read_text()) == {"action": "connect", "ssid": "Office",
+                                                         "password": "pw123456"}
+
+
+def test_a_wired_screen_gets_the_gentle_version(monkeypatch):
+    _on(monkeypatch, WIRED)
+    page = TestClient(_client(role="display", name="Lobby").app, client=LAN).post(
+        "/api/wifi/connect", data={"ssid": "Office", "password": "x"}).text
+    assert "Connect Lobby to Office?" in page and "stays on its network cable" in page
+    assert 'class="danger"' not in page
+
+
+def test_the_move_screen_names_who_loses_touch(monkeypatch):
+    from app import pairing
+    _on(monkeypatch, WIFI_NOW)
+    pairing.set_controller({"device_id": "c0ffee00", "name": "Sanctuary", "address": "192.0.2.5",
+                            "site_key": "ab" * 32})
+    page = TestClient(_client(role="display").app, client=LAN).post(
+        "/api/wifi/connect", data={"ssid": "Office"}).text
+    assert "Sanctuary can only send it content while they&rsquo;re on the same network" in page
+    pairing.forget_controller()
+    pairing.add_display_record({"device_id": "aaaa1111", "name": "Lobby", "address": "192.0.2.8", "port": 8080})
+    page = TestClient(_client(role="controller").app, client=LAN).post(
+        "/api/wifi/connect", data={"ssid": "Office"}).text
+    assert "Lobby only gets content while on the same network as this controller" in page
+
+
+def test_the_move_screen_shows_names_as_text(monkeypatch):
+    _on(monkeypatch, WIFI_NOW, ssid="<i>Home</i>")
+    page = TestClient(_client(role="display").app, client=LAN).post(
+        "/api/wifi/connect", data={"ssid": '"><b>x</b>', "password": '"><b>pw</b>'}).text
+    assert "<b>x</b>" not in page and "<i>Home</i>" not in page and "<b>pw</b>" not in page
+    assert 'name="ssid" value="&quot;&gt;&lt;b&gt;x&lt;/b&gt;"' in page
+
+
+def test_a_blank_name_asks_nothing(monkeypatch):
+    _on(monkeypatch, WIFI_NOW)
+    r = TestClient(_client(role="display").app, client=LAN).post(
+        "/api/wifi/connect", data={"ssid": "   "}, follow_redirects=False)
+    assert r.status_code == 303 and not wifi.pending()
+
+
+# --- on the setup network ------------------------------------------------------------
+
+def test_the_setup_network_page_says_what_connect_does_and_has_no_off_switch(monkeypatch):
+    monkeypatch.setattr(discovery, "hosting_ap", lambda: True)
+    wifi.STATUS_PATH.write_text(json.dumps({"ap_active": True}))
+    page = TestClient(_client(role="display").app, client=PHONE, base_url=SETUP_HOST).get("/wifi-setup").text
+    assert "your phone drops off it" in page
+    assert "Stop setup network" not in page
+
+
+def test_from_the_normal_network_the_off_switch_is_offered(monkeypatch):
+    monkeypatch.setattr(discovery, "hosting_ap", lambda: True)
+    wifi.STATUS_PATH.write_text(json.dumps({"ap_active": True}))
+    page = TestClient(_client(role="display").app, client=TV).get("/wifi-setup").text
+    assert "Stop setup network" in page and "your phone drops off it" not in page
+
+
+def test_a_phone_on_the_setup_network_cannot_turn_it_off_when_locked(monkeypatch):
+    client = TestClient(_locked(monkeypatch, hosting=True), client=PHONE, base_url=SETUP_HOST)
+    assert client.post("/api/wifi/stop", follow_redirects=False).status_code == 401
