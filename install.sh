@@ -1030,7 +1030,13 @@ else
   if ! git clone --depth 1 "\$REPO_URL" "\$SRC" >/dev/null 2>&1; then say failed "could not download the update (no internet, or the repository is private)"; exit 0; fi
 fi
 REL="\${RELEASES}/rel-\$(date +%s)"; rm -rf "\$REL"; mkdir -p "\$REL"
-cp -a "\$SRC/." "\$REL/"; rm -rf "\$REL/.venv" "\$REL/.git"; chown -R \${APP_USER}:\${APP_USER} "\$REL"
+cp -a "\$SRC/." "\$REL/"; rm -rf "\$REL/.venv" "\$REL/.git"
+# Stamp what this release was built from, the same way the installer does, so the
+# device still knows its version after "Update now" and not only after a full update.
+VER="\$(git -C "\$SRC" rev-parse --short=8 HEAD 2>/dev/null || true)"
+if [ -n "\$VER" ]; then git -C "\$SRC" diff --quiet HEAD 2>/dev/null || VER="\${VER}+local"; else VER="unknown"; fi
+printf '%s installed %s\n' "\$VER" "\$(date -Is)" > "\$REL/VERSION"
+chown -R \${APP_USER}:\${APP_USER} "\$REL"
 say running "installing dependencies"
 if ! prep_venv "\$REL"; then say failed "could not prepare the new version; staying on the current one"; rm -rf "\$REL"; exit 0; fi
 # Same pre-activation gate the installer uses: build the real app object in the new
