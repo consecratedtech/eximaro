@@ -22,7 +22,9 @@ import secrets
 import sys
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import BackgroundTasks, FastAPI, Form, Request, UploadFile
 from fastapi.responses import (
@@ -277,9 +279,16 @@ def create_app() -> FastAPI:
         activity.log("Set the control-panel password" if first else "Changed the control-panel password")
         return resp
 
+    @app.get("/password/clear", response_class=HTMLResponse)
+    def password_clear_confirm():
+        cfg = current()
+        return _page("Remove the password", cfg.get("role") or "display", cfg, _password_clear_body(cfg))
+
     @app.post("/api/password/clear")
-    def password_clear(request: Request):
+    def password_clear(request: Request, confirm: str = Form(default="")):
         # Reachable only with a live session (the middleware gates it).
+        if confirm != "yes":
+            return RedirectResponse("/password/clear", status_code=303)
         auth.clear_credentials()
         sessions.clear_all()
         activity.log("Removed the control-panel password — the panel is open again")
@@ -329,11 +338,26 @@ def create_app() -> FastAPI:
         role = cfg.get("role") or "display"
         return _page("Health", role, cfg, _health_body(cfg, role, device_id, _started), active="health")
 
+    @app.get("/role", response_class=HTMLResponse)
+    def role_confirm(role: str = ""):
+        cfg = current()
+        now = cfg.get("role")
+        if role not in config.VALID_ROLES or now not in config.VALID_ROLES or role == now:
+            return RedirectResponse("/", status_code=303)
+        return _page("Switch role", now, cfg, _role_switch_body(cfg, role, device_id))
+
     @app.post("/api/role")
-    def set_role(role: str = Form(...)):
+    def set_role(role: str = Form(...), confirm: str = Form(default="")):
         if role not in config.VALID_ROLES:
             return JSONResponse({"error": "invalid role"}, status_code=400)
         cfg = current()
+        now = cfg.get("role")
+        if role == now:
+            return RedirectResponse("/", status_code=303)
+        # The very first choice, on the first-run setup page, is its own explanation.
+        # Changing a role that is already set goes through the confirmation screen.
+        if now in config.VALID_ROLES and confirm != "yes":
+            return RedirectResponse(f"/role?role={role}", status_code=303)
         cfg["role"] = role
         config.save_config(cfg)
         _readvertise()
@@ -345,12 +369,26 @@ def create_app() -> FastAPI:
             activity.log("Requested install of PowerPoint conversion packages")
         return RedirectResponse("/", status_code=303)
 
+    @app.get("/display-here", response_class=HTMLResponse)
+    def display_here_confirm():
+        cfg = current()
+        if cfg.get("role") != "controller" or not cfg.get("display_content", True):
+            return RedirectResponse("/", status_code=303)
+        return _page("This screen", "controller", cfg, _display_here_off_body(cfg, device_id))
+
     @app.post("/api/display-here")
-    def display_here(show: str = Form(default="")):
+    def display_here(show: str = Form(default=""), confirm: str = Form(default="")):
         # Whether a controller mirrors the playlist on its own attached screen.
         # Off makes it a pure management box (blank/idle screen). Displays ignore it.
         cfg = current()
-        cfg["display_content"] = show == "on"
+        on = show == "on"
+        if on == cfg.get("display_content", True):
+            return RedirectResponse("/", status_code=303)
+        # Turning it on brings the playlist back at once. Turning it off blanks a TV,
+        # so on a controller that goes through the confirmation screen first.
+        if not on and cfg.get("role") == "controller" and confirm != "yes":
+            return RedirectResponse("/display-here", status_code=303)
+        cfg["display_content"] = on
         config.save_config(cfg)
         activity.log("Content on this screen: " + ("on" if cfg["display_content"] else "off"))
         return RedirectResponse("/", status_code=303)
@@ -661,11 +699,25 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
         _autopush(background)
         return RedirectResponse(_content_back(), status_code=303)
 
+    @app.get("/content/remove", response_class=HTMLResponse)
+    def remove_content_confirm(item_id: str = ""):
+        cfg = current()
+        role = cfg.get("role") or "display"
+        return _page("Remove from the playlist", role, cfg, _remove_item_body(cfg, item_id, device_id),
+                     active="content" if role == "controller" else "home")
+
     @app.post("/api/content/remove")
-    def remove_content(background: BackgroundTasks, item_id: str = Form(...)):
+    def remove_content(background: BackgroundTasks, item_id: str = Form(...),
+                       confirm: str = Form(default="")):
+        # Only the confirmation screen's explicit yes removes anything (see _confirm_card).
+        if confirm != "yes":
+            return RedirectResponse(f"/content/remove?item_id={quote(item_id)}", status_code=303)
+        gone = next((i for i in library.list_items() if i["id"] == item_id), None)
+        if gone is None:                   # already removed: a second tap, an old tab
+            return RedirectResponse(_content_back(), status_code=303)
         library.remove(item_id)
         _autopush(background)
-        activity.log("Removed an item from the playlist")
+        activity.log("Removed an item from the playlist", gone.get("name") or "")
         return RedirectResponse(_content_back(), status_code=303)
 
     @app.post("/api/content/seconds")
@@ -725,8 +777,17 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
         activity.log("Shuffle turned " + ("on" if cfg["shuffle"] else "off"))
         return RedirectResponse(_content_back(), status_code=303)
 
+    @app.get("/update", response_class=HTMLResponse)
+    def update_confirm():
+        cfg = current()
+        return _page("Update", cfg.get("role") or "display", cfg, _update_body(cfg))
+
     @app.post("/api/update")
-    def do_update():
+    def do_update(confirm: str = Form(default="")):
+        if confirm != "yes":
+            return RedirectResponse("/update", status_code=303)
+        if _update_running():               # one is already under way
+            return RedirectResponse("/", status_code=303)
         updater.request_update()
         activity.log("Started a software update")
         return RedirectResponse("/", status_code=303)
@@ -764,9 +825,16 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
         # true only while a request file is still sitting unhandled.
         return {"in_progress": updater.in_progress(), **updater.status()}
 
+    @app.get("/promote", response_class=HTMLResponse)
+    def promote_confirm():
+        cfg = current()
+        return _page("PowerPoint support", cfg.get("role") or "display", cfg, _promote_body(cfg))
+
     @app.post("/api/promote")
-    def promote_now():
+    def promote_now(confirm: str = Form(default="")):
         # Manual (re)trigger of the conversion-package install from the UI.
+        if confirm != "yes":
+            return RedirectResponse("/promote", status_code=303)
         if not promote.has_conversion_tools():
             promote.request_promotion()
             activity.log("Requested install of PowerPoint conversion packages")
@@ -774,9 +842,25 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
 
     # --- pairing: display side ----------------------------------------------
 
+    @app.get("/pair/start", response_class=HTMLResponse)
+    def pair_start_confirm():
+        cfg = current()
+        if not pairing.is_claimed():
+            return RedirectResponse("/", status_code=303)
+        return _page("Re-pair this screen", cfg.get("role") or "display", cfg,
+                     _repair_body(cfg))
+
     @app.post("/api/pair/start")
-    def pair_start():
+    def pair_start(confirm: str = Form(default="")):
+        # An unpaired screen shows its code at once: that is how pairing starts, and
+        # "Cancel pairing" undoes it. A paired one covers its content with the code and
+        # can be taken over, so that goes through the confirmation screen first.
+        claimed = pairing.is_claimed()
+        if claimed and confirm != "yes":
+            return RedirectResponse("/pair/start", status_code=303)
         pairing.start_pairing()
+        if claimed:
+            activity.log("Showed a pairing code so a different controller can take over this screen")
         return RedirectResponse("/", status_code=303)
 
     @app.post("/api/pair/cancel")
@@ -784,10 +868,18 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
         pairing.cancel_pairing()
         return RedirectResponse("/", status_code=303)
 
+    @app.get("/received/clear", response_class=HTMLResponse)
+    def received_clear_confirm():
+        cfg = current()
+        return _page("Remove pushed content", cfg.get("role") or "display", cfg,
+                     _clear_pushed_body(cfg, device_id))
+
     @app.post("/api/received/clear")
-    def received_clear():
+    def received_clear(confirm: str = Form(default="")):
         # Take down content a controller pushed — usable from the display itself
         # even when the controller is offline. Falls back to local content / idle.
+        if confirm != "yes":
+            return RedirectResponse("/received/clear", status_code=303)
         sync.clear_received()
         activity.log("Removed content pushed from the controller")
         return RedirectResponse("/", status_code=303)
@@ -795,7 +887,8 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
     @app.get("/pair/forget", response_class=HTMLResponse)
     def pair_forget_confirm():
         """The "are you sure?" screen before a display unpairs. See _unpair_confirm_body."""
-        return _page("Unpair this screen", "display", current(), _unpair_confirm_body())
+        cfg = current()
+        return _page("Unpair this screen", cfg.get("role") or "display", cfg, _unpair_confirm_body())
 
     @app.post("/api/pair/forget")
     def pair_forget(confirm: str = Form(default="")):
@@ -892,10 +985,21 @@ img{{background:#fff;padding:8px;border-radius:12px;display:block;border:1px sol
         _autopush(background)
         return RedirectResponse("/", status_code=303)
 
+    @app.get("/displays/remove", response_class=HTMLResponse)
+    def displays_remove_confirm(request: Request):
+        cfg = current()
+        return _page("Unpair a display", cfg.get("role") or "display", cfg,
+                     _remove_display_body(cfg, request.query_params.get("device_id", ""), device_id))
+
     @app.post("/api/displays/remove")
-    def displays_remove(device: str = Form(..., alias="device_id")):
+    def displays_remove(device: str = Form(..., alias="device_id"), confirm: str = Form(default="")):
+        if confirm != "yes":
+            return RedirectResponse(f"/displays/remove?device_id={quote(device)}", status_code=303)
+        gone = next((d for d in pairing.list_displays() if d["device_id"] == device), None)
+        if gone is None:                   # already unpaired
+            return RedirectResponse("/", status_code=303)
         pairing.remove_display(device)
-        activity.log("Unpaired a display")
+        activity.log("Unpaired a display", gone.get("name") or "")
         return RedirectResponse("/", status_code=303)
 
     @app.post("/api/push")
@@ -1216,12 +1320,12 @@ def _settings_drawer(cfg: dict, role: str) -> str:
             <form method="post" action="/api/password/set" style="margin-top:10px">
               <input name="username" value="{uname}" placeholder="username" required>
               <input name="password" type="password" placeholder="new password (min 6)" required>
+              <p class="hint">Everyone else who is signed in will need the new password.</p>
               <button class="btn-primary full" type="submit">Save new password</button>
             </form>
           </details>
-          <form method="post" action="/api/password/clear" style="margin-top:10px"
-                onsubmit="return confirm('Remove the password? The panel will be open to anyone on your network.');">
-            <button class="btn-danger full" type="submit">Remove password (make open)</button>
+          <form method="get" action="/password/clear" style="margin-top:10px">
+            <button class="btn-danger full" type="submit">Remove the password&hellip;</button>
           </form>
           <form method="post" action="/logout" style="margin-top:10px">
             <button class="btn-ghost full" type="submit">Log out</button>
@@ -1270,8 +1374,8 @@ def _settings_drawer(cfg: dict, role: str) -> str:
         <div class="section">
           <h3>Pairing {_tip('pairing')}</h3>
           <p>Paired to <span class="now">{_cn}</span>{_ca}, which sends this screen its content.</p>
-          <form method="post" action="/api/pair/start">
-            <button class="btn-ghost full" type="submit">Re-pair to another controller</button>
+          <form method="get" action="/pair/start">
+            <button class="btn-ghost full" type="submit">Re-pair this screen&hellip;</button>
           </form>
           <form method="get" action="/pair/forget">
             <button class="btn-danger full" type="submit">Unpair this screen&hellip;</button>
@@ -1353,8 +1457,8 @@ def _settings_drawer(cfg: dict, role: str) -> str:
             staged and health-checked &mdash; if a new version doesn't start, the device
             rolls back to the previous one automatically.</p>
           {upd_line}
-          <form method="post" action="/api/update" onsubmit="startUpdate();return false;">
-            <button class="btn-accent full" type="submit">Update now</button>
+          <form method="get" action="/update">
+            <button class="btn-accent full" type="submit">Update now&hellip;</button>
           </form>
         </div>"""
 
@@ -1411,10 +1515,9 @@ def _settings_drawer(cfg: dict, role: str) -> str:
         <div class="section">
           <h3>Role <span class="tip" data-tip="{_esc(other_tip)}" aria-label="More info">i</span></h3>
           <p>This device is currently a <span class="now">{role_label}</span>.</p>
-          <form method="post" action="/api/role"
-                onsubmit="return confirm('Switch this device to {other_label}? You can switch back anytime.');">
+          <form method="get" action="/role">
             <input type="hidden" name="role" value="{other}">
-            <button class="btn-accent full" type="submit">Switch to {other_label}</button>
+            <button class="btn-accent full" type="submit">Switch to {other_label}&hellip;</button>
           </form>
         </div>
 
@@ -1541,35 +1644,39 @@ _WORKING_HTML = """
     function hideWorking(){var w=document.getElementById('working');if(!w)return;
       w.classList.remove('on');w.setAttribute('aria-hidden','true');}
     // Coming back via the back button (bfcache) must not leave a stale overlay up.
-    window.addEventListener('pageshow',hideWorking);
+    // Back to a page from the browser's cache shows it as it was left, so a box unticked on
+    // the way to a confirmation screen would still look unticked. Put every box back to
+    // what the page said when it was served.
+    window.addEventListener('pageshow',function(){hideWorking();
+      document.querySelectorAll('input[type=checkbox]').forEach(function(c){c.checked=c.defaultChecked;});});
     // Software update: poll the ACTUAL update status (not /healthz) so we react to
     // the real outcome. A failed update never restarts the app, so there is no
     // restart to detect — only the status says 'failed'. Must be called as
     // onsubmit="startUpdate();return false;" — an async function returns a Promise,
     // which is truthy, so `return startUpdate()` would NOT cancel the native submit.
     async function startUpdate(){
-      if(!confirm('Update to the latest version? The screen restarts briefly.'))return false;
-      showWorking('Updating\\u2026 this can take a minute or two. The page refreshes when it is done.');
+      // The question was asked on the /update screen; this only runs from its yes.
+      showWorking('Updating\\u2026 This page comes back by itself when the update is done.');
       // Remember the previous status timestamp, so a stale result from a past update
       // (e.g. a leftover 'done') can't make us reload before this update even starts.
       var before='';
       try{before=((await (await fetch('/api/update-status',{cache:'no-store'})).json())||{}).when||'';}catch(e){}
-      try{await fetch('/api/update',{method:'POST'});}catch(e){}
+      try{await fetch('/api/update',{method:'POST',body:new URLSearchParams({confirm:'yes'})});}catch(e){}
       var tries=0;
       var iv=setInterval(async function(){
         tries++;
         try{
           var s=(await (await fetch('/api/update-status',{cache:'no-store'})).json())||{};
           if(s.when&&s.when!==before){                 // a fresh status from THIS update
-            if(s.state==='done'){clearInterval(iv);location.reload();return;}
+            // Home, not a reload: a reload would land back on the /update question.
+            // A failed update says so in the "Update problem" banner on every page.
+            if(s.state==='done'){clearInterval(iv);location.assign('/');return;}
             if(s.state==='failed'||s.state==='rolled_back'){
-              clearInterval(iv);hideWorking();
-              alert('Update did not complete: '+(s.detail||s.state));
-              location.reload();return;
+              clearInterval(iv);hideWorking();location.assign('/');return;
             }
           }
         }catch(e){}                              // the server may be restarting mid-swap
-        if(tries>150){clearInterval(iv);location.reload();}   // ~5 min hard cap
+        if(tries>150){clearInterval(iv);location.assign('/');}   // ~5 min hard cap
       },2000);
       return false;
     }
@@ -1596,6 +1703,413 @@ def _update_alert_banner() -> str:
       </div>"""
 
 
+def _confirm_card(title: str, lead: str, bullets, keep_label: str, keep_href: str,
+                  yes_label: str, action: str, fields: dict = None, closing: str = "",
+                  danger: bool = True, onsubmit: str = "") -> str:
+    """Every "are you sure?" screen in the panel, built the same way.
+
+    The people pressing these buttons are not technical, so before anything happens
+    each screen says in plain words what will happen: to the TV, to the other screens,
+    and how to undo it. The safe choice is the main button. The yes posts confirm=yes,
+    and the route behind it refuses to act without that, so a stray tap, an old cached
+    page or a bookmarked form lands back on the explanation instead.
+
+    `title`, `lead`, `bullets` and `closing` are HTML: escape every real name in them."""
+    points = "".join(f"<li>{b}</li>" for b in bullets if b)
+    points_html = f'<ul class="hint">{points}</ul>' if points else ""
+    closing_html = f'<p class="hint">{closing}</p>' if closing else ""
+    hidden = "".join(f'<input type="hidden" name="{_esc(k)}" value="{_esc(v)}">'
+                     for k, v in (fields or {}).items())
+    submit = f' onsubmit="{onsubmit}"' if onsubmit else ""
+    yes_class = "btn-danger" if danger else "btn-ghost"
+    return f"""
+          <div class="card" style="overflow-wrap:anywhere">
+            <h2 style="display:block">{title}</h2>
+            <p>{lead}</p>
+            {points_html}
+            {closing_html}
+            <div class="row">
+              <form method="get" action="{keep_href}">
+                <button class="btn-primary" type="submit">{keep_label}</button>
+              </form>
+              <form method="post" action="{action}"{submit}>
+                <input type="hidden" name="confirm" value="yes">{hidden}
+                <button class="{yes_class}" type="submit">{yes_label}</button>
+              </form>
+            </div>
+          </div>"""
+
+
+def _nothing_card(title: str, hint: str, back_href: str = "/", back_label: str = "Back") -> str:
+    """Shown in place of a confirmation when there is nothing left to confirm: the item
+    is already gone, the screen isn't paired, the update is already on its way."""
+    return f"""
+          <div class="card">
+            <h2>{title}</h2>
+            <p class="hint">{hint}</p>
+            <form method="get" action="{back_href}"><button class="btn-ghost" type="submit">{back_label}</button></form>
+          </div>"""
+
+
+def _names(names) -> str:
+    """'A', 'A and B' or 'A, B and C': for naming the screens something affects."""
+    names = [n for n in names if n]
+    if len(names) < 2:
+        return "".join(names)
+    return ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _count(n: int, word: str) -> str:
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def _display_names(displays) -> list:
+    return [_esc(d.get("name") or d["device_id"][:8]) for d in displays]
+
+
+def _go_to_controller(controller: dict) -> str:
+    """A link to the controller's Content page, when its address is known."""
+    addr = pairing.lan_address(controller.get("address"))
+    if not addr:
+        return ""
+    name = _esc(controller.get("name") or "its controller")
+    return (f' <a href="http://{_esc(addr)}:{config.PORT}/content">Open {name}&rsquo;s '
+            f'Content page</a>.')
+
+
+_WAITING = "&ldquo;Waiting for content&hellip;&rdquo;"
+
+
+def _remove_item_body(cfg: dict, item_id: str, device_id: str) -> str:
+    """Before an item comes off the playlist. It names the exact item - a tap on the
+    wrong row of a phone-sized list is the usual mistake - and which screens lose it."""
+    role = cfg.get("role") or "display"
+    back = "/content" if role == "controller" else "/"
+    items = library.list_items()
+    item = next((i for i in items if i["id"] == item_id), None)
+    if not item:
+        return _nothing_card("That item isn&rsquo;t in the playlist any more",
+                             "Someone may have removed it already. Nothing has changed.", back,
+                             "Back to the playlist")
+    name = _esc(item.get("name") or "this item")
+    device = _esc(cfg["name"])
+    rest = [i for i in items if i["id"] != item_id]
+    bullets = []
+    if role == "controller":
+        playing, emptied = [], []
+        screens = [(device_id, f"{device}&rsquo;s own screen")] if cfg.get("display_content", True) else []
+        screens += [(d["device_id"], n) for d, n in zip(pairing.list_displays(),
+                                                        _display_names(pairing.list_displays()))]
+        for sid, label in screens:
+            if item in sync.items_for_display(items, sid):
+                playing.append(label)
+                if not sync.items_for_display(rest, sid):
+                    emptied.append(label)
+        bullets.append(f"It comes off {_names(playing)}." if playing
+                       else "No screen is showing it right now.")
+        if emptied:
+            bullets.append(f"{_names(emptied)} will have nothing left to play and will show {_WAITING}")
+    elif sync.screen_items() is not None:
+        ctl = _esc((pairing.get_controller() or {}).get("name") or "its controller")
+        bullets.append(f"This screen is playing what {ctl} sends, so nothing changes on it right now.")
+    elif item in sync.items_for_display(items, device_id):
+        bullets.append("It comes off this screen.")
+        if not sync.items_for_display(rest, device_id):
+            bullets.append(f"This screen will have nothing left to play and will show {_WAITING}")
+    else:
+        bullets.append("This screen isn&rsquo;t showing it right now.")
+    kind, ref = item.get("type"), str(item.get("ref") or "")
+    if kind == "slideshow":
+        bullets.append(f"Its slides are deleted from {device}. To show it again, you will need "
+                       f"the original PowerPoint file.")
+    elif kind == "image" or (kind == "video" and not ref.startswith("http")):
+        bullets.append(f"Its file is deleted from {device}. To show it again, you will need the "
+                       f"original file.")
+    else:
+        link = f"https://www.youtube.com/watch?v={item['yt_id']}" if item.get("yt_id") else ref
+        # Most links are named by the link itself, which the title already shows.
+        if (item.get("name") or "") in (link, ref):
+            bullets.append("It is only a link, so you can add it again later.")
+        else:
+            bullets.append(f'It is only a link, so you can add it again later with this link: '
+                           f'<span class="mono">{_esc(link)}</span>')
+    closing = ""
+    if role == "controller" and pairing.list_displays():
+        closing = ("Only want it off some screens? Use &ldquo;On:&rdquo; under its name to pick "
+                   "its screens. Nothing is deleted that way.")
+    return _confirm_card(f"Remove &ldquo;{name}&rdquo;?", "If you remove it from the playlist:",
+                         bullets, "Keep it", back, "Yes, remove it", "/api/content/remove",
+                         fields={"item_id": item_id}, closing=closing)
+
+
+def _remove_display_body(cfg: dict, target: str, device_id: str) -> str:
+    """Before a controller stops sending to one of its displays."""
+    device = _esc(cfg["name"])
+    displays = pairing.list_displays()
+    d = next((x for x in displays if x["device_id"] == target), None)
+    if not d:
+        return _nothing_card(f"That display isn&rsquo;t paired with {device}",
+                             "It may have been unpaired already. Nothing has changed.")
+    dname = _esc(d.get("name") or d["device_id"][:8])
+    # Items aimed at this display and at no other screen this controller still runs
+    # would play nowhere once it is gone - say so, by name.
+    live = {x["device_id"] for x in displays} | {device_id}
+    only_it = [f"&ldquo;{_esc(i.get('name') or 'an item')}&rdquo;" for i in library.list_items()
+               if i.get("targets") and set(i["targets"]) & live == {d["device_id"]}]
+    bullets = [f"{dname} keeps showing what it has now, but nothing you change here will reach it.",
+               f"{dname}&rsquo;s own panel will still say it is controlled by {device}.",
+               "Nothing changes on your other screens."]
+    if only_it:
+        one = len(only_it) == 1
+        bullets.append(f"{_names(only_it)} only show{'s' if one else ''} on {dname}, so after this "
+                       f"{'it' if one else 'they'} will show on no screen.")
+    addr = pairing.lan_address(d.get("address"))
+    try:
+        port = int(d.get("port") or config.PORT)
+    except (TypeError, ValueError):
+        port = config.PORT
+    panel = (f'<a href="http://{addr}:{port}/">{dname}&rsquo;s own panel</a>' if addr
+             else f"{dname}&rsquo;s own panel")
+    bullets.append(f"To pair it again later, open {panel}, go to Settings, choose "
+                   f"&ldquo;Re-pair this screen&hellip;&rdquo; and press &ldquo;Yes, show a pairing "
+                   f"code&rdquo;. Then enter that code under &ldquo;Find displays&rdquo; here.")
+    return _confirm_card(f"Unpair {dname}?", f"{dname} gets its content from {device}. If you unpair it:",
+                         bullets, "Keep it paired", "/", f"Yes, unpair {dname}", "/api/displays/remove",
+                         fields={"device_id": d["device_id"]},
+                         closing=f"Only want to change what {dname} shows? Change the playlist on the "
+                                 f"Content page instead.")
+
+
+def _clear_pushed_body(cfg: dict, device_id: str) -> str:
+    """Before a display drops the content its controller pushed to it."""
+    pushed = sync.screen_items()
+    if pushed is None or cfg.get("role") == "controller":
+        return _nothing_card("Nothing from a controller is on this screen",
+                             "A controller always plays its own playlist." if cfg.get("role") == "controller"
+                             else "There is nothing to remove.")
+    controller = pairing.get_controller() or {}
+    ctl = _esc(controller.get("name") or "its controller")
+    own = sync.items_for_display(library.list_items(), device_id)
+    if pushed:
+        one = len(pushed) == 1
+        lead = (f"This screen is playing {_count(len(pushed), 'item')} that {ctl} sent. "
+                f"If you remove {'it' if one else 'them'}:")
+        gone = f"{'It comes' if one else 'They come'} off this screen straight away"
+        first = (f"{gone}, and it plays its own {_count(len(own), 'item')} instead." if own else
+                 f"{gone}. It has nothing of its own to play, so it will show {_WAITING}")
+    else:
+        # A controller sends an empty list to a screen none of its items are aimed at.
+        lead = f"{ctl} sent this screen an empty playlist, so it shows {_WAITING}. If you remove it:"
+        first = (f"It plays its own {_count(len(own), 'item')} instead." if own
+                 else "Nothing changes on the TV.")
+    bullets = [
+        first,
+        (f"This screen stays paired. The next time {ctl} sends (when anything changes there, or "
+         f"when someone presses &ldquo;Push to all displays&rdquo;), this screen plays {ctl}&rsquo;s "
+         f"playlist again." if pairing.is_claimed() else ""),
+        f"Nothing changes on {ctl} or on your other screens.",
+    ]
+    return _confirm_card(f"Remove {ctl}&rsquo;s content from this screen?", lead, bullets,
+                         "Keep it on this screen", "/", "Yes, remove it from this screen",
+                         "/api/received/clear",
+                         closing=(f"Only want to change what this screen shows? Change it on {ctl} "
+                                  f"instead. This screen updates by itself.{_go_to_controller(controller)}"))
+
+
+def _role_switch_body(cfg: dict, to_role: str, device_id: str) -> str:
+    """Before a device changes role. Both directions change what screens show, so both
+    say exactly which screens and how, and how to switch back."""
+    device = _esc(cfg["name"])
+    bullets = []
+    if to_role == "controller":
+        controller = pairing.get_controller() or {}
+        ctl = _esc(controller.get("name") or "its controller")
+        claimed = pairing.is_claimed()
+        pushed_now = sync.screen_items() is not None
+        own = len(sync.items_for_display(library.list_items(), device_id))
+        shows_own = cfg.get("display_content", True)
+        if pushed_now:
+            lead = f"{device} is a display that shows what {ctl} sends. If you switch it to Controller:"
+            bullets.append(f"Its screen stops showing what {ctl} sends. {ctl} still lists it, but "
+                           f"changes made there won&rsquo;t show on it.")
+        elif claimed:
+            lead = f"{device} is a display paired to {ctl}. If you switch it to Controller:"
+            bullets.append(f"{ctl} can keep sending to it, but nothing it sends will show while it "
+                           f"is a Controller.")
+        else:
+            lead = f"{device} is a display. If you switch it to Controller:"
+        if own and not shows_own:
+            bullets.append(f"&ldquo;Show content on this screen&rdquo; is turned off, so its screen will "
+                           f"show {_WAITING}. To play its own {_count(own, 'item')}, tick that box in Settings.")
+        elif own:
+            bullets.append(f"Its screen plays {device}&rsquo;s own {_count(own, 'item')} instead."
+                           if pushed_now else "Its screen keeps playing what it plays now.")
+        elif pushed_now:
+            bullets.append(f"It has nothing of its own to play, so its screen will show {_WAITING}")
+        bullets.append("This panel changes: its playlist moves to a new Content page, and it gets a "
+                       "Screens page for pairing displays.")
+        if not promote.has_conversion_tools():
+            bullets.append("It also downloads PowerPoint support from the internet, which takes a "
+                           "while. Its screen keeps playing meanwhile.")
+        bullets.append("To undo, open Settings and choose &ldquo;Switch to Display&hellip;&rdquo;."
+                       + (f" It is still paired to {ctl}, so what {ctl} sends shows again."
+                          if claimed else ""))
+        closing = (f"Only want to change what this screen shows? Change it on {ctl} instead. "
+                   f"This screen updates by itself.{_go_to_controller(controller)}" if claimed else "")
+        return _confirm_card(f"Switch {device} to Controller?", lead, bullets, "Keep it a Display", "/",
+                             "Yes, switch to Controller", "/api/role", fields={"role": "controller"},
+                             closing=closing)
+    displays = pairing.list_displays()
+    names = _names(_display_names(displays))
+    one = len(displays) == 1
+    lead = (f"{device} is the controller for {names}. If you switch it to Display:" if displays
+            else f"{device} is a controller with no displays paired. If you switch it to Display:")
+    if displays:
+        bullets.append(f"{names} {'stops' if one else 'stop'} getting changes from {device}. "
+                       f"{'It keeps' if one else 'They keep'} showing what "
+                       f"{'it has' if one else 'they have'} now.")
+    if sync.screen_items() is not None:
+        # A device that was a display before still holds what its controller sent it, and
+        # a display plays that ahead of its own playlist.
+        old = _esc((pairing.get_controller() or {}).get("name") or "a controller")
+        bullets.append(f"{device}&rsquo;s own screen plays what {old} sent it, not its own playlist. "
+                       f"To play its playlist, use &ldquo;Remove pushed content&hellip;&rdquo; on its "
+                       f"Home afterwards.")
+    elif not cfg.get("display_content", True):
+        bullets.append(f"{device}&rsquo;s own screen starts playing its playlist.")
+    else:
+        bullets.append(f"{device}&rsquo;s own screen keeps playing its playlist.")
+    bullets.append("This panel changes: the Content page goes away, and the playlist moves to Home.")
+    bullets.append("To undo, open Settings and choose &ldquo;Switch to Controller&hellip;&rdquo;."
+                   + (f" {names} then get{'s' if one else ''} changes from it again." if displays else ""))
+    return _confirm_card(f"Switch {device} to Display?", lead, bullets, "Keep it a Controller", "/",
+                         "Yes, switch to Display", "/api/role", fields={"role": "display"})
+
+
+def _update_running() -> bool:
+    """True while an update is under way: asked for and not picked up yet, or picked up
+    and still running. The helper deletes the request the moment it starts, so the
+    request alone goes quiet during the download and build - exactly when a second
+    press would queue a second update. A "running" status more than an hour old is
+    left from an interrupted update (a power cut, say) and does not count."""
+    if updater.in_progress():
+        return True
+    st = updater.status()
+    if st.get("state") != "running":
+        return False
+    try:
+        when = datetime.fromisoformat(str(st.get("when", "")))
+    except ValueError:
+        return False
+    if when.tzinfo is None:
+        return False
+    return (datetime.now(timezone.utc) - when).total_seconds() < 3600
+
+
+def _update_body(cfg: dict) -> str:
+    """Before a software update: what the screen does while it happens, and that a
+    failed update puts itself back."""
+    device = _esc(cfg["name"])
+    if _update_running():
+        return _nothing_card("An update is already on its way",
+                             f"{device} is already getting the newest version, so there is no need to "
+                             f"press it again. When it restarts, its screen shows "
+                             f"&ldquo;Starting up&hellip;&rdquo; for about a minute.")
+    role = cfg.get("role")
+    others = bool(pairing.list_displays()) if role == "controller" else pairing.is_claimed()
+    bullets = [
+        f"{device} downloads the newest version of its app from the internet. Its screen carries on "
+        f"as normal meanwhile.",
+        "Then it restarts. Its screen goes dark for a moment, then shows "
+        "&ldquo;Starting up&hellip;&rdquo; for about a minute.",
+        f"Only {device} is updated. Your other screens keep playing." if others else "",
+        ("Everyone is signed out when it restarts. You will need the password to sign in again."
+         if auth.has_credentials() else ""),
+        f"If anything goes wrong, {device} stays on the version it has now, or goes back to it by itself.",
+    ]
+    return _confirm_card(f"Update {device} now?",
+                         "Best done when nobody needs the screen. If you update now:",
+                         bullets, "Not now", "/", "Yes, update now", "/api/update", danger=False,
+                         onsubmit="startUpdate();return false;")
+
+
+def _password_clear_body(cfg: dict) -> str:
+    """Before the panel is opened to anyone on the network."""
+    device = _esc(cfg["name"])
+    if not auth.has_credentials():
+        return _nothing_card("This panel has no password", "There is nothing to remove.")
+    bullets = [
+        "Anyone on your network can open this panel and change its content, settings and pairing.",
+        "Anyone could also set their own password and lock you out.",
+        "Your screens keep playing.",
+        "To lock it again, open Settings and choose &ldquo;Lock this panel&rdquo;.",
+    ]
+    return _confirm_card(f"Remove the password from {device}?",
+                         f"Right now only people with the password can change content, settings and "
+                         f"pairing on {device}. If you remove it:",
+                         bullets, "Keep the password", "/", "Yes, remove the password",
+                         "/api/password/clear")
+
+
+def _display_here_off_body(cfg: dict, device_id: str) -> str:
+    """Before a controller's own screen stops playing the playlist."""
+    device = _esc(cfg["name"])
+    shown = _display_names(pairing.list_displays())
+    one = len(shown) == 1
+    others = (f"{_names(shown)} {'keeps' if one else 'keep'} playing. Nothing changes on "
+              f"{'it' if one else 'them'}." if shown else "")
+    back_on = ("Nothing is deleted. To turn it back on, open Settings and tick "
+               "&ldquo;Show content on this screen&rdquo;.")
+    if sync.items_for_display(library.list_items(), device_id):
+        lead = f"Right now {device}&rsquo;s own screen plays the playlist. If you turn this off:"
+        first = f"{device}&rsquo;s screen stops playing and shows {_WAITING}"
+    else:
+        lead = f"{device}&rsquo;s own screen has nothing to play right now. If you turn this off:"
+        first = "It won&rsquo;t play anything you add later either, until you turn this back on."
+    return _confirm_card(f"Stop showing content on {device}&rsquo;s own screen?", lead,
+                         [first, others, back_on], "Keep showing content", "/", "Yes, turn it off",
+                         "/api/display-here")
+
+
+def _repair_body(cfg: dict) -> str:
+    """Before a paired display puts up a pairing code for a different controller."""
+    controller = pairing.get_controller() or {}
+    ctl = _esc(controller.get("name") or "its controller")
+    bullets = [
+        "Its TV shows a big pairing code instead of its content, for up to 3 minutes.",
+        f"The first controller to enter the code takes over this screen. If that isn&rsquo;t {ctl}, "
+        f"{ctl} can no longer send to it, and every Push from {ctl} will fail.",
+        "If nobody enters the code, nothing changes. You can also press &ldquo;Cancel pairing&rdquo; on Home.",
+    ]
+    return _confirm_card("Re-pair this screen?",
+                         f"This screen is paired to {ctl}. If you go on:", bullets,
+                         "Not now", "/", "Yes, show a pairing code", "/api/pair/start",
+                         closing=(f"Only want to change what this screen shows? Change it on {ctl} "
+                                  f"instead. This screen updates by itself.{_go_to_controller(controller)}"))
+
+
+def _promote_body(cfg: dict) -> str:
+    """Before the PowerPoint conversion software is downloaded and installed."""
+    device = _esc(cfg["name"])
+    if promote.has_conversion_tools():
+        return _nothing_card("PowerPoint support is already installed", "There is nothing to install.")
+    state = promote.conversion_state()
+    if state.get("state") == "installing":
+        return _nothing_card("PowerPoint support is being installed", _esc(state.get("detail", "")))
+    bullets = [
+        "It downloads from the internet and takes a while.",
+        "Your screens keep playing while it installs.",
+        "If there is no internet, it stops. You can try again later.",
+        ("The last try didn&rsquo;t finish. Trying again is safe."
+         if state.get("state") == "failed" else ""),
+    ]
+    return _confirm_card(f"Install PowerPoint support on {device}?",
+                         f"{device} needs extra software to turn PowerPoint files into slides. If you install it:",
+                         bullets, "Not now", "/", "Yes, install it", "/api/promote",
+                         closing="Google Slides, web pages, images and videos work without it.",
+                         danger=False)
+
+
 def _unpair_confirm_body() -> str:
     """What a person sees before unpairing a display from its controller.
 
@@ -1609,37 +2123,23 @@ def _unpair_confirm_body() -> str:
     points at the place the content should really be changed: the controller."""
     controller = pairing.get_controller()
     if not controller:
-        return """
-          <div class="card">
-            <h2>This screen isn't paired</h2>
-            <p class="hint">There is nothing to unpair.</p>
-            <form method="get" action="/"><button class="btn-ghost" type="submit">Back</button></form>
-          </div>"""
+        return _nothing_card("This screen isn't paired", "There is nothing to unpair.")
     name = _esc(controller.get("name") or "the controller")
-    addr = controller.get("address") or ""
-    go_there = (f' <a href="http://{_esc(addr)}:{config.PORT}/content">Open {name}&rsquo;s '
-                f'content page</a>.' if addr else "")
-    return f"""
-          <div class="card">
-            <h2>Unpair this screen from {name}?</h2>
-            <p>This screen is paired to <b>{name}</b>. If you unpair it:</p>
-            <ul class="hint">
-              <li><b>{name} can no longer send anything to this screen.</b> Every Push to it
-                will fail until it is paired again.</li>
-              <li>What {name} sent is taken off this screen straight away.</li>
-            </ul>
-            <p class="hint">Only want to change what this screen shows? Change it on
-              <b>{name}</b> instead &mdash; this screen updates by itself.{go_there}</p>
-            <div class="row">
-              <form method="get" action="/">
-                <button class="btn-primary" type="submit">Keep it paired</button>
-              </form>
-              <form method="post" action="/api/pair/forget">
-                <input type="hidden" name="confirm" value="yes">
-                <button class="btn-danger" type="submit">Yes, unpair this screen</button>
-              </form>
-            </div>
-          </div>"""
+    bullets = [
+        f"<b>{name} can no longer send anything to this screen.</b> Every Push to it will "
+        f"fail until it is paired again.",
+        f"What {name} sent is taken off this screen straight away.",
+        (f"It plays its own {_count(len(library.list_items()), 'item')} instead."
+         if library.list_items() else f"It will show {_WAITING}"),
+        f"To pair it again, press &ldquo;Start pairing&rdquo; on this screen&rsquo;s Home. Then on "
+        f"{name}, use &ldquo;Add by address&rdquo; and enter the code.",
+    ]
+    return _confirm_card(f"Unpair this screen from {name}?",
+                         f"This screen is paired to <b>{name}</b>. If you unpair it:", bullets,
+                         "Keep it paired", "/", "Yes, unpair this screen", "/api/pair/forget",
+                         closing=(f"Only want to change what this screen shows? Change it on "
+                                  f"<b>{name}</b> instead &mdash; this screen updates by itself."
+                                  f"{_go_to_controller(controller)}"))
 
 
 def _page(title: str, role: str, cfg: dict, body: str, active: str = "home") -> HTMLResponse:
@@ -1933,9 +2433,9 @@ def _content_body(cfg: dict, displays=None) -> str:
                 </span>
                 <span class="name"><span class="nm" title="{_esc(it['name'])}">{_esc(it['name'])}</span>{targets_html}</span>
                 {secs_html}
-                <form method="post" action="/api/content/remove">
+                <form method="get" action="/content/remove">
                   <input type="hidden" name="item_id" value="{it['id']}">
-                  <button class="x" title="Remove">&times;</button>
+                  <button class="x" title="Remove&hellip;" aria-label="Remove {_esc(it['name'])}">&times;</button>
                 </form>
                 {note}{src_html}{toggles_html}
               </div>"""
@@ -2020,7 +2520,7 @@ def _display_home(cfg: dict) -> HTMLResponse:
         section = f"""
           <div class="card">
             <h2>Pairing {_tip('pairing')}</h2>
-            <p class="hint">On your controller, pick this display and enter this code:</p>
+            <p class="hint">On your controller, tap &ldquo;Find displays&rdquo;, then enter this code next to this display:</p>
             <div class="code">{_esc(code)}</div>
             <div class="status"><span class="pulse"><i></i></span>
               Waiting to connect · valid for 3 minutes. It also shows on the screen itself.</div>
@@ -2035,7 +2535,7 @@ def _display_home(cfg: dict) -> HTMLResponse:
         # so they are the controller's real ones today, renamed or not.
         controller = pairing.get_controller() or {}
         c_name = _esc(controller.get("name") or "its controller")
-        c_addr = controller.get("address") or ""
+        c_addr = pairing.lan_address(controller.get("address"))
         where = f' at <span class="mono">{_esc(c_addr)}</span>' if c_addr else ""
         go_there = (f'<a href="http://{_esc(c_addr)}:{config.PORT}/content">open '
                     f'{c_name}&rsquo;s Content page</a>' if c_addr else f"use {c_name}")
@@ -2071,9 +2571,8 @@ def _display_home(cfg: dict) -> HTMLResponse:
               {from_name}. Only remove it if {from_name} is offline and it has to come off
               this screen now &mdash; the next Push from {from_name} puts it back. To
               change what plays, change it on {from_name} instead.</p>
-            <form method="post" action="/api/received/clear"
-                  onsubmit="return confirm('Remove the content pushed to this screen? It will fall back to this screen’s own content or the idle screen.');">
-              <button class="btn-danger" type="submit">Remove pushed content</button>
+            <form method="get" action="/received/clear">
+              <button class="btn-danger" type="submit">Remove pushed content&hellip;</button>
             </form>
           </div>"""
 
@@ -2103,10 +2602,10 @@ def _promote_banner(conv: dict) -> str:
     if state == "failed":
         return (f'<div class="card note warn"><h2>PowerPoint support didn\'t install</h2>'
                 f'<p class="hint">{detail}</p>'
-                f'<form method="post" action="/api/promote"><button class="btn-accent" type="submit">Try again</button></form></div>')
+                f'<form method="get" action="/promote"><button class="btn-accent" type="submit">Try again&hellip;</button></form></div>')
     return (f'<div class="card note"><h2>PowerPoint support not installed</h2>'
             f'<p class="hint">{detail} You can still use Google Slides, web pages, and images.</p>'
-            f'<form method="post" action="/api/promote"><button class="btn-accent" type="submit">Install PowerPoint support</button></form></div>')
+            f'<form method="get" action="/promote"><button class="btn-accent" type="submit">Install PowerPoint support&hellip;</button></form></div>')
 
 
 def _push_card() -> str:
@@ -2154,9 +2653,9 @@ def _control_home(cfg: dict) -> HTMLResponse:
               <div class="item">
                 <span class="name">{_esc(d['name'] or d['device_id'][:8])}</span>
                 <span class="meta">{_esc(d['address'])}</span>
-                <form method="post" action="/api/displays/remove">
+                <form method="get" action="/displays/remove">
                   <input type="hidden" name="device_id" value="{d['device_id']}">
-                  <button class="x" title="Unpair">&times;</button>
+                  <button class="x" title="Unpair&hellip;" aria-label="Unpair {_esc(d['name'] or d['device_id'][:8])}">&times;</button>
                 </form>
               </div>"""
         screens_inner = rows

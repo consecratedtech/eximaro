@@ -81,7 +81,8 @@ def test_unpair_and_repair_live_in_settings_not_on_the_page():
     pairing.set_controller(dict(CONTROLLER))
     body, drawer = _split(_client().get("/").text)
     assert 'action="/pair/forget"' in drawer and 'action="/pair/forget"' not in body
-    assert 'action="/api/pair/start"' in drawer and 'action="/api/pair/start"' not in body
+    assert 'action="/pair/start"' in drawer and 'action="/pair/start"' not in body
+    assert 'action="/api/pair/start"' not in body + drawer          # re-pair asks first too
     assert "Unpair this screen and remove the pushed content?" not in body + drawer   # old popup
 
 
@@ -97,7 +98,7 @@ def test_remove_pushed_content_sits_below_the_content():
     sync._save({"items": [{"type": "url", "src": "https://example.com", "seconds": 10}],
                 "shuffle": False})
     body, _ = _split(_client().get("/").text)
-    assert body.index('action="/api/received/clear"') > body.index("<h2>Playlist")
+    assert body.index('action="/received/clear"') > body.index("<h2>Playlist")
     assert body.index("Controlled by") < body.index("<h2>Playlist")     # who-controls stays on top
 
 
