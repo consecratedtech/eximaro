@@ -12,6 +12,9 @@ import hashlib
 import json
 import shutil
 import sys
+import threading
+import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -20,6 +23,28 @@ from . import commands, config
 
 RECEIVED_PATH = config.DATA / "received.json"
 RECV_ASSETS = config.DATA / "recv_assets"
+SEQ_PATH = config.DATA / "push-seq"      # controller side: the number of its last push
+# Push numbers count milliseconds; anything this large is not one (and a far larger one
+# would not even turn back into text).
+MAX_SEQ = 2 ** 53
+
+_SEQ_LOCK = threading.Lock()
+_last_seq = 0
+_SAVE_LOCK = threading.Lock()   # display side: one new playlist replaces the old at a time
+
+
+class Refused(Exception):
+    """A push signed by this screen's controller that the screen still won't take. The
+    message says why. `stale` means it has this push or a newer one already; `seq`, if
+    known, is the newest it has taken."""
+
+    def __init__(self, why: str, status: int = 409, stale: bool = False, seq=None,
+                 misaddressed: bool = False):
+        super().__init__(why)
+        self.status = status
+        self.stale = stale
+        self.seq = seq
+        self.misaddressed = misaddressed
 
 
 def canon(manifest: dict) -> bytes:
@@ -110,6 +135,91 @@ def build_manifest(items: list, from_name: str, base_url: str, shuffle: bool = F
     return {"items": out, "from": from_name, "shuffle": bool(shuffle)}
 
 
+def _store_seq(seq: int) -> None:
+    global _last_seq
+    _last_seq = max(_last_seq, seq)
+    try:
+        config.DATA.mkdir(parents=True, exist_ok=True)
+        tmp = SEQ_PATH.with_suffix(".tmp")
+        tmp.write_text(str(_last_seq))
+        tmp.replace(SEQ_PATH)
+    except OSError as exc:
+        print(f"push: could not save the number of the last push: {exc}", file=sys.stderr, flush=True)
+
+
+def seq_ok(value) -> bool:
+    """Could this be a push number?"""
+    return isinstance(value, int) and not isinstance(value, bool) and 0 < value < MAX_SEQ
+
+
+def _stored_seq() -> int:
+    try:
+        seq = int(SEQ_PATH.read_text().strip())
+    except (OSError, ValueError):
+        return 0
+    return seq if seq_ok(seq) else 0
+
+
+def highest_seq() -> int:
+    """The highest number this controller has given a push."""
+    return max(_stored_seq(), _last_seq)
+
+
+def next_seq() -> int:
+    """The number for the next push: higher than any this controller has used before,
+    across restarts too, so a display can tell a new push from an old one played back to
+    it. It is kept in a file, and never below the clock in milliseconds, so it still
+    rises should that file ever be lost."""
+    with _SEQ_LOCK:
+        seq = max(highest_seq() + 1, int(time.time() * 1000))
+        _store_seq(seq)
+        return seq
+
+
+def seq_proof(site_key: str, seq: int, device_id: str) -> str:
+    """Display side: vouches, with the site key, for the newest push number it has
+    taken, so that its controller can trust that number and no one else's."""
+    return commands.sign(site_key, f"seq:{seq}:{device_id}".encode())
+
+
+def _vouched_seq(answer: dict, site_key: str, device_id: str):
+    """The newest push number a display says it has taken, if it vouched for it with
+    the site key - else None."""
+    seq, proof = answer.get("seq"), answer.get("proof")
+    if seq_ok(seq) and isinstance(proof, str) and commands.verify(
+            site_key, f"seq:{seq}:{device_id}".encode(), proof):
+        return seq
+    return None
+
+
+def screen_proof(site_key: str, device_id: str, seq: int) -> str:
+    """Display side, turning away a push numbered `seq` that was meant for another
+    screen: vouches, with the site key, for which screen it is, so the controller can
+    tell where its screens answer now."""
+    return commands.sign(site_key, f"screen:{device_id}:{seq}".encode())
+
+
+def _vouched_screen(answer: dict, site_key: str, seq: int):
+    """The device id of the screen that answered a push numbered `seq` meant for
+    another, if it vouched for it with the site key - else None. Bound to this push's
+    number, so an answer recorded earlier can't be played back."""
+    me, proof = answer.get("screen"), answer.get("screen_proof")
+    if (isinstance(me, str) and 0 < len(me) <= 64 and isinstance(proof, str)
+            and commands.verify(site_key, f"screen:{me}:{seq}".encode(), proof)):
+        return me
+    return None
+
+
+def note_seq(seen: int) -> None:
+    """A display vouched that it has taken a push numbered `seen` from this controller,
+    above any this controller remembers giving (it was put back from an old backup, say,
+    with its clock behind): number the next push above it."""
+    if seq_ok(seen):
+        with _SEQ_LOCK:
+            if seen > highest_seq():
+                _store_seq(seen)
+
+
 def push_all(displays: list, manifest: dict, site_key: str) -> list:
     signature = commands.sign(site_key, canon(manifest))
     results = []
@@ -130,31 +240,74 @@ def items_for_display(items: list, device_id: str) -> list:
 
 
 def push_targeted(displays: list, items: list, from_name: str, base_url: str, site_key: str,
-                  shuffle: bool = False) -> list:
+                  shuffle: bool = False, seq=None) -> list:
     """Per-display targeting: build each display its own manifest from the items
     aimed at it, sign it, and push. Untargeted items stack onto every display.
+
+    Every manifest is addressed and numbered, inside what is signed: a display takes a
+    push only if it is meant for that display and newer than the last one it took, so a
+    push recorded off the network can't be played back to it later, or to another
+    screen - nor does one land on whichever screen has since been given the address
+    this one used to have. `seq` is this push's number; the caller takes it when it
+    reads `items` (next_seq), so a later push always carries newer content.
 
     Displays are pushed concurrently, so one slow or offline display can't hold up
     the rest — the whole push takes as long as the slowest single display, not the
     sum of them all. Result order matches the input display order."""
+    if seq is None:
+        seq = next_seq()
+
+    def _send(d: dict, mine: list, number: int):
+        manifest = build_manifest(mine, from_name, base_url, shuffle)
+        manifest["to"] = d["device_id"]
+        manifest["seq"] = number
+        signature = commands.sign(site_key, canon(manifest))
+        return post_json(f"http://{d['address']}:{d['port']}/api/playlist",
+                         {"manifest": manifest, "signature": signature})
+
     def _one(d: dict) -> dict:
         name = d.get("name") or d["device_id"][:8]
         mine = items_for_display(items, d["device_id"])
-        manifest = build_manifest(mine, from_name, base_url, shuffle)
-        signature = commands.sign(site_key, canon(manifest))
-        url = f"http://{d['address']}:{d['port']}/api/playlist"
         try:
-            resp = post_json(url, {"manifest": manifest, "signature": signature})
-            # The display answers with the name it has NOW (absent on an older one).
-            fresh = resp.get("name") if isinstance(resp, dict) else None
-            return {"name": name, "ok": True, "count": len(mine), "display_name": fresh}
+            resp = _send(d, mine, seq)
+        except urllib.error.HTTPError as exc:
+            said = _answer(exc)
+            why = said.get("error") if isinstance(said.get("error"), str) else exc.reason
+            failed = {"name": name, "ok": False, "count": len(mine), "error": f"HTTP Error {exc.code}: {why}"}
+            if exc.code != 409:
+                return failed
+            seen = _vouched_seq(said, site_key, d["device_id"])
+            if seen == seq:
+                # It has this very push already: an earlier try got there.
+                return {"name": name, "ok": True, "count": len(mine), "display_name": None}
+            if seen is not None and seen > seq:
+                # It has a push numbered above this one: a newer push of ours got there
+                # first, or this controller's count was set back (put back from an old
+                # backup, say, with its clock behind). Either way it is to be sent what is
+                # here now, under a number above what it has (push_with_rediscovery).
+                note_seq(seen)
+                return dict(failed, ahead=seen)
+            other = _vouched_screen(said, site_key, seq)
+            return dict(failed, elsewhere=other) if other else failed
         except Exception as exc:
             return {"name": name, "ok": False, "error": str(exc)}
+        # The display answers with the name it has NOW (absent on an older one).
+        fresh = resp.get("name") if isinstance(resp, dict) else None
+        return {"name": name, "ok": True, "count": len(mine), "display_name": fresh}
 
     if not displays:
         return []
     with ThreadPoolExecutor(max_workers=min(8, len(displays))) as pool:
         return list(pool.map(_one, displays))
+
+
+def _answer(exc: urllib.error.HTTPError) -> dict:
+    """The JSON a display sent with an error, or {}."""
+    try:
+        said = json.loads(exc.read().decode())
+    except Exception:
+        return {}
+    return said if isinstance(said, dict) else {}
 
 
 def plain_error(exc_text: str, address: str, port) -> str:
@@ -163,6 +316,14 @@ def plain_error(exc_text: str, address: str, port) -> str:
     if "http error 403" in t or "http error 401" in t:
         return (f"the screen at {address} refused the push: it is no longer paired to this "
                 f"controller. Pair it again from the Screens page")
+    if "http error 409" in t and "another screen" in t:
+        return (f"a different screen answers at {address} now, so the push was not left "
+                f"there. This screen is not on the network at the moment, or not where "
+                f"this controller can find it. If it is on, open its own panel to see its "
+                f"address, and pair it again from there")
+    if "http error 409" in t:
+        return (f"the screen at {address} already has newer content than this push. Press "
+                f"Push again to send it what is here now")
     if "http error" in t:
         return f"the screen at {address} answered an error ({exc_text})"
     # No answer at all. The address is the one the screen had when it was paired — if
@@ -175,35 +336,58 @@ def plain_error(exc_text: str, address: str, port) -> str:
 
 def push_with_rediscovery(displays: list, items: list, from_name: str, base_url: str,
                           site_key: str, shuffle: bool = False, browse=None, update=None,
-                          rename=None) -> list:
+                          rename=None, seq=None, fresh=None) -> list:
     """push_targeted, plus the thing an operator should never have to do by hand:
     a display's address is captured when it is paired and DHCP can move it any time.
-    When a push can't reach a display, look for it on the LAN by its device id; if it
-    is there on a different address, remember the new one and push again. Only runs
-    the (3-second) LAN browse when something actually failed. Every result carries a
-    plain-language 'error' so the panel can say what went wrong, not just who."""
-    results = push_targeted(displays, items, from_name, base_url, site_key, shuffle)
+    When a push can't reach a display, look for it by its device id - a screen that
+    turned away a push meant for another says which screen it is, and the LAN browse
+    finds the rest; if it is on a different address, remember the new one and push
+    again. Only runs the (3-second) LAN browse when something actually failed and those
+    answers didn't place it. Every result carries a plain-language 'error' so the panel
+    can say what went wrong, not just who.
+
+    `fresh()`, when given, takes a new snapshot (items, from_name, shuffle, seq) the way
+    the caller took this one: a screen that already has a push numbered above this one
+    is sent what is here now, under a number above what it has."""
+    if seq is None:
+        seq = next_seq()
+    results = push_targeted(displays, items, from_name, base_url, site_key, shuffle, seq=seq)
     by_id = {d["device_id"]: d for d in displays}
-    failed = [d for d, r in zip(displays, results) if not r.get("ok")]
-    if failed and browse is not None:
+    found = {r["elsewhere"]: (d["address"], d["port"])
+             for d, r in zip(displays, results) if r.get("elsewhere") in by_id}
+    failed = [d for d, r in zip(displays, results) if not r.get("ok") and not r.get("ahead")]
+    if browse is not None and any(d["device_id"] not in found for d in failed):
         try:
-            seen = {f["device_id"]: f for f in browse(3.0) if f.get("device_id")}
+            for f in browse(3.0):
+                if f.get("device_id") and f.get("address"):
+                    found.setdefault(f["device_id"], (f["address"], f.get("port")))
         except Exception:
-            seen = {}
-        moved = []
-        for d in failed:
-            f = seen.get(d["device_id"])
-            if f and f.get("address") and (f["address"], f.get("port")) != (d.get("address"), d.get("port")):
-                nd = dict(d, address=f["address"], port=f.get("port") or d.get("port"))
-                moved.append(nd)
-                if update is not None:
-                    update(nd)                 # remember where it lives now
-        if moved:
-            retry = push_targeted(moved, items, from_name, base_url, site_key, shuffle)
-            fixed = {m["device_id"]: r for m, r in zip(moved, retry)}
-            results = [fixed.get(d["device_id"], r) for d, r in zip(displays, results)]
-            for m in moved:
-                by_id[m["device_id"]] = m
+            pass
+    moved = []
+    for d in failed:
+        address, port = found.get(d["device_id"], (None, None))
+        if address and (address, port or d.get("port")) != (d.get("address"), d.get("port")):
+            nd = dict(d, address=address, port=port or d.get("port"))
+            moved.append(nd)
+            if update is not None:
+                update(nd)                 # remember where it lives now
+    if moved:
+        # The same push, and the same number: it is the one these screens missed.
+        retry = push_targeted(moved, items, from_name, base_url, site_key, shuffle, seq=seq)
+        fixed = {m["device_id"]: r for m, r in zip(moved, retry)}
+        results = [fixed.get(d["device_id"], r) for d, r in zip(displays, results)]
+        for m in moved:
+            by_id[m["device_id"]] = m
+    ahead = [by_id[d["device_id"]] for d, r in zip(displays, results) if r.get("ahead")]
+    if ahead and fresh is not None:
+        items2, from2, shuffle2, seq2 = fresh()
+        again = push_targeted(ahead, items2, from_name=from2, base_url=base_url,
+                              site_key=site_key, shuffle=shuffle2, seq=seq2)
+        # Still ahead means a push newer even than this one got there first: up to date.
+        fixed = {a["device_id"]: ({"name": r["name"], "ok": True, "count": r.get("count"),
+                                   "display_name": None} if r.get("ahead") else r)
+                 for a, r in zip(ahead, again)}
+        results = [fixed.get(d["device_id"], r) for d, r in zip(displays, results)]
     for d, r in zip(displays, results):
         if not r.get("ok"):
             cur = by_id[d["device_id"]]
@@ -235,12 +419,41 @@ def _save(playlist: dict) -> None:
     tmp.replace(RECEIVED_PATH)
 
 
-def receive(manifest: dict, signature: str, controller_site_key: str) -> bool:
-    """Verify the manifest came from our controller, then cache it + its images."""
+def _check_order(manifest: dict, me, last_seq) -> None:
+    """Is this signed push one for this screen to take, given the newest it has taken
+    from its controller (`last_seq`)? Raises Refused if not."""
+    to, seq = manifest.get("to"), manifest.get("seq")
+    if to is not None and to != me:
+        raise Refused("this push was meant for another screen", misaddressed=True)
+    if seq is None:
+        # Pushes from a controller from before numbering carry none, and are taken as
+        # before - until a numbered one has been: then one without is an old push played
+        # back. Refused as "not paired", which tells an old controller what fixes it.
+        if last_seq is not None:
+            raise Refused("this push is older than what the screen has", status=403)
+        return
+    if not seq_ok(seq):
+        raise Refused("this push has no usable number")
+    if last_seq is not None and seq <= last_seq:
+        raise Refused("this screen already has this push, or a newer one", stale=True, seq=last_seq)
+
+
+def receive(manifest: dict, signature: str, controller_site_key: str,
+            me=None, last_seq=None, take=None) -> bool:
+    """Verify the manifest came from our controller, then cache it + its images.
+
+    `me` (this screen's device id) and `take` turn on the check that a push is meant
+    for this screen and newer than the last one taken from the controller (`last_seq`):
+    one that isn't is refused (Refused) before anything is fetched. `take(seq)` records
+    the push's number as the newest taken, just before its playlist replaces the old
+    one, and says False if one at least as new was taken meanwhile - so a push that took
+    longer to fetch than a newer one doesn't put the older content back."""
     if not manifest or not signature:
         return False
     if not commands.verify(controller_site_key, canon(manifest), signature):
         return False
+    if me is not None:
+        _check_order(manifest, me, last_seq)
 
     RECV_ASSETS.mkdir(parents=True, exist_ok=True)
     items = []
@@ -294,7 +507,10 @@ def receive(manifest: dict, signature: str, controller_site_key: str) -> bool:
             except Exception:
                 continue  # skip an image we couldn't fetch; keep the rest playing
             items.append({"type": "image", "src": f"/recv-asset/{name}", "seconds": it["seconds"]})
-    _save({"items": items, "shuffle": bool(manifest.get("shuffle"))})
+    with _SAVE_LOCK:
+        if take is not None and not take(manifest.get("seq")):
+            raise Refused("this screen already has this push, or a newer one", stale=True)
+        _save({"items": items, "shuffle": bool(manifest.get("shuffle"))})
     return True
 
 

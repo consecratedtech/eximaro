@@ -137,6 +137,28 @@ def refresh_controller(name: str = "", address: str = "") -> bool:
         return changed
 
 
+def take_push(seq, site_key: str) -> bool:
+    """Display side, just before a verified push replaces what is on screen: record its
+    number as the newest taken from the controller. False if one at least as new has
+    been taken meanwhile, or the screen was unpaired, or paired to another controller
+    since the push was checked against `site_key` - then it must not be applied. A push
+    from a controller from before numbering has none, and is taken only while no
+    numbered one has been. Pairing again starts the count afresh."""
+    with VAULT_LOCK:
+        vault = Vault()
+        record = vault.get("controller")
+        if not record or record.get("site_key") != site_key:
+            return False
+        last = record.get("last_seq")
+        if seq is None:
+            return last is None
+        if last is not None and seq <= last:
+            return False
+        record["last_seq"] = seq
+        vault.set("controller", record)
+        return True
+
+
 def is_claimed() -> bool:
     return Vault().has("controller")
 

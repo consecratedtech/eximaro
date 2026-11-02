@@ -21,6 +21,7 @@ import io
 import ipaddress
 import secrets
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -119,6 +120,7 @@ MAX_UPLOAD_BYTES = 1024 * 1024 * 1024  # 1 GB ceiling for any single upload
 def create_app() -> FastAPI:
     device_id = identity.get_or_create_device_id()
     _started = time.time()
+    push_snapshot = threading.Lock()   # see _push_now
 
     def current() -> dict:
         cfg = config.load_config()
@@ -139,12 +141,20 @@ def create_app() -> FastAPI:
         if not displays:
             return []
         base_url = f"http://{discovery.primary_ip()}:{config.PORT}"
+
+        # Pushes can run side by side (an edit's own push and a press of Push). What a
+        # push sends and the number it goes out under are taken together, so the later
+        # number always comes with the newer content, and a screen keeps that one.
+        def fresh():
+            with push_snapshot:
+                cfg = current()
+                return library.list_items(), cfg["name"], bool(cfg.get("shuffle")), sync.next_seq()
+
+        items, name, shuffle, seq = fresh()
         return sync.push_with_rediscovery(
-            displays, library.list_items(), current()["name"],
-            base_url, auth.get_or_create_site_key(),
-            shuffle=bool(current().get("shuffle")),
+            displays, items, name, base_url, auth.get_or_create_site_key(), shuffle=shuffle,
             browse=discovery.browse, update=pairing.add_display_record,
-            rename=pairing.rename_display,
+            rename=pairing.rename_display, seq=seq, fresh=fresh,
         )
 
     def _autopush(background: BackgroundTasks) -> None:
@@ -1021,9 +1031,32 @@ def create_app() -> FastAPI:
         body = await request.json()
         # receive() verifies the signature then downloads assets; run it off the
         # event loop so a slow or large push can never block the kiosk web server.
-        ok = await run_in_threadpool(
-            sync.receive, body.get("manifest"), body.get("signature"), controller["site_key"]
-        )
+        # It also turns away a push meant for another screen, or one older than the
+        # newest taken - an old push played back to this screen.
+        key = controller["site_key"]
+        try:
+            ok = await run_in_threadpool(
+                sync.receive, body.get("manifest"), body.get("signature"), key,
+                me=device_id, last_seq=controller.get("last_seq"),
+                take=lambda seq: pairing.take_push(seq, key),
+            )
+        except sync.Refused as exc:
+            answer = {"error": str(exc)}
+            # Already has it, or newer: say how new, vouched for with the site key, so the
+            # controller knows this screen is up to date - and no one else can feed it a
+            # number.
+            seq = exc.seq
+            if seq is None:
+                now = pairing.get_controller() or {}
+                seq = now.get("last_seq") if now.get("site_key") == key else None
+            if exc.stale and sync.seq_ok(seq):
+                answer.update(seq=seq, proof=sync.seq_proof(key, seq, device_id))
+            # Meant for another screen: say which screen this is, vouched for and tied to
+            # this push, so the controller learns where its screens answer now.
+            pushed = body.get("manifest", {}).get("seq") if isinstance(body.get("manifest"), dict) else None
+            if exc.misaddressed and sync.seq_ok(pushed):
+                answer.update(screen=device_id, screen_proof=sync.screen_proof(key, device_id, pushed))
+            return JSONResponse(answer, status_code=exc.status)
         if not ok:
             return JSONResponse({"error": "rejected"}, status_code=403)
         # The push is verified, so what it says about its sender can be trusted: keep
