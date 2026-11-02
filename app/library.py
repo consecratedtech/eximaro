@@ -16,7 +16,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import config, convert
+from . import config, convert, net
 
 LIBRARY_PATH = config.DATA / "library.json"
 ASSETS = config.DATA / "assets"
@@ -182,8 +182,13 @@ def _slides_plan(url: str):
 
 def add_url(url: str, seconds: int = DEFAULT_URL_SECONDS, name: str = "") -> dict:
     url = url.strip()
-    if not url.startswith(("http://", "https://")):
+    if not re.match(r"https?:", url, re.I):
         url = "https://" + url
+    # Saved the way the screen's browser reads it. A phone capitalises the first letter,
+    # and "Https://..." used to be saved as "https://Https://...", which plays nowhere;
+    # "Docs.Google.com" wasn't seen as a deck, so its /pub page went into the frame and
+    # Google refused it there.
+    url = net.web_link(url)
     if _is_youtube(url) and _youtube_id(url):
         # A single YouTube video times itself: it plays in full, then the screen
         # moves on (seconds=0, like an uploaded video), so the passed-in seconds is

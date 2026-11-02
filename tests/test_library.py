@@ -622,3 +622,18 @@ def test_a_failed_measurement_is_stamped_so_it_is_not_retried_at_once(monkeypatc
     out = library.measure_slides(item["id"])
     assert isinstance(out.get("measure_tried"), int)
     assert library.due_for_measure(out) is False                   # not again for an hour
+
+
+def test_add_url_saves_the_link_the_way_the_screen_reads_it():
+    # A phone capitalises the first letter of what is typed; a link copied from
+    # somewhere odd can carry a slash too many. Both used to be saved as something the
+    # screen couldn't play: "https://Https://...", or a deck not seen as one.
+    deck = library.add_url("Https://Docs.Google.com/presentation/d/e/2PACX-x/pub"
+                           "?start=false&loop=false&delayms=3000")
+    assert deck["ref"] == ("https://docs.google.com/presentation/d/e/2PACX-x/embed"
+                           "?start=false&loop=true&delayms=3000")
+    assert deck["name"] == "Google Slides"
+    assert library.add_url("HTTPS://example.com/board")["ref"] == "https://example.com/board"
+    assert library.add_url("https:///example.com/board")["ref"] == "https://example.com/board"
+    yt = library.add_url("Https://www.YouTube.com/watch?v=jNQXAC9IVRw")
+    assert yt.get("youtube") and yt["yt_id"] == "jNQXAC9IVRw"
