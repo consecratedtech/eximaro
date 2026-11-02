@@ -259,10 +259,11 @@ def probe(url: str, now: float = None, starting: bool = False):
             keep = PROBE_CACHE_SECONDS
         except _ErrorPage:
             # On the screen that page would stay until the deck is next loaded, a quarter
-            # of an hour for a deck playing alone. Google's own advice is to come back in
-            # a few minutes, so this waits as long as any answer does.
+            # of an hour for a deck playing alone. It comes and goes from one request to
+            # the next, so ask again on the short cycle: the slides start as soon as Google
+            # serves them. It counts, so two minutes of nothing else goes quiet for fifteen.
             ok, reason = False, "Google sent an error page instead of the deck"
-            keep = PROBE_CACHE_SECONDS
+            keep = CACHE_SECONDS
         except Exception as exc:
             # Google had the request, but the answer was too slow or was cut off. That
             # may have counted as a view, so it waits as long as an answer would.

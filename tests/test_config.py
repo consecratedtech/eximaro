@@ -822,6 +822,7 @@ def test_googles_error_page_in_place_of_the_deck_holds_it_back(monkeypatch):
     # Google sometimes answers a deck with 200 OK and its own error page ("Google Docs
     # encountered an error. Please try reloading..."), same title, no slides. Seen on a
     # test screen: the status alone said the deck was fine, and the error page went up.
+    # The next answer is often the deck, so it is asked again on the short cycle.
     from http.server import BaseHTTPRequestHandler, HTTPServer
     from app import net
     net.reset_cache()
@@ -853,8 +854,14 @@ def test_googles_error_page_in_place_of_the_deck_holds_it_back(monkeypatch):
         monkeypatch.setattr(net, "_fetch", lambda u: (fetched.append(u), real(u))[1])
         ok, why = net.probe(base + "/broken", now=1000.0)
         assert ok is False and why == "Google sent an error page instead of the deck"
-        net.probe(base + "/broken", now=1000.0 + net.PROBE_CACHE_SECONDS - 1)
-        assert len(fetched) == 1                       # kept like any answer: one load per 15 min
+        net.probe(base + "/broken", now=1000.0 + net.CACHE_SECONDS - 1)
+        assert len(fetched) == 1                       # not asked on every poll...
+        for s in (21, 42, 63, 84, 105, 126):
+            net.probe(base + "/broken", now=1000.0 + s)
+        assert len(fetched) == 7                       # ...but again shortly: it comes and goes
+        assert net.quiet_for(base + "/broken", now=1127.0) > 0   # two minutes of it: quiet
+        net.probe(base + "/broken", now=1200.0)
+        assert len(fetched) == 7                       # and quiet means Google isn't asked
         assert net.probe(base + "/deck", now=1000.0) == (True, "")
     finally:
         server.shutdown()
