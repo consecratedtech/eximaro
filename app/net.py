@@ -264,7 +264,8 @@ def last_probe(url: str):
 
 def host_of(url: str) -> str:
     """The hostname an item will be fetched from, or '' for a local/relative one
-    (an uploaded image or video is served by this device and always reachable)."""
+    (an uploaded image or video is served by this device and always reachable).
+    Raises ValueError for a web link that can't be read at all."""
     if not isinstance(url, str) or not url.startswith(("http://", "https://")):
         return ""
     return (urlsplit(url).hostname or "").lower()
@@ -276,7 +277,7 @@ def _resolves(host: str) -> bool:
     try:
         socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
         return True
-    except OSError:
+    except (OSError, ValueError):        # ValueError: a name that can't even be asked
         return False
     finally:
         socket.setdefaulttimeout(old)
@@ -341,8 +342,16 @@ def problems(urls, now: float = None, online: bool = True, starting: bool = Fals
     _note_online(online, now)
     found = {}
     for u in urls:
-        h = host_of(u)
-        if u in found or not h or _is_local(h):
+        if u in found:
+            continue
+        try:
+            h = host_of(u)
+            if h and not _is_local(h):
+                h.encode("idna")         # a name no lookup could ever answer ("cdn..example.com")
+        except ValueError:               # a UnicodeError is a ValueError too
+            found[u] = "this link isn't a web address the screen can open"
+            continue
+        if not h or _is_local(h):
             continue
         if not online or not reachable(h, now, starting):
             found[u] = "no network yet"

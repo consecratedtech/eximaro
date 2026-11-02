@@ -714,3 +714,51 @@ def test_screen_data_names_each_item_that_cannot_be_shown(monkeypatch):
     assert set(data["blocked"]) == {refused, video}                   # the good deck plays
     assert data["blocked"][video] == "no network yet"                 # a web video is checked too
     assert data["content_reachable"] is False and data["content_note"]
+
+
+BAD_LINKS = ("https://cdn..example.com/promo.mp4", "https://[cdn.example.com/promo.mp4",
+             "https://cdn.example.com／promo.mp4", "https://" + "a" * 64 + ".example.com/x.mp4")
+
+
+def test_a_link_that_cannot_be_read_blocks_only_itself(monkeypatch):
+    from app import net
+    net.reset_cache()
+    good = "https://docs.google.com/presentation/d/e/2PACX-good/embed"
+    looked_up = []
+    monkeypatch.setattr(net, "_resolves", lambda h: (looked_up.append(h), True)[1])
+    monkeypatch.setattr(net, "_fetch", lambda u: (u, 200))
+    found = net.problems([good, *BAD_LINKS])
+    assert set(found) == set(BAD_LINKS) and good not in found
+    assert all("web address" in why for why in found.values())
+    assert looked_up == ["docs.google.com"]                  # nothing is looked up for them
+    monkeypatch.undo()
+    assert net._resolves("cdn..example.com") is False         # and a lookup can't raise either
+
+
+def test_screen_data_survives_a_link_that_cannot_be_read(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import discovery, library, net
+    from app.server import create_app
+    net.reset_cache()
+    monkeypatch.setattr(discovery, "advertise", lambda *a, **k: None)
+    monkeypatch.setattr(discovery, "has_address", lambda: True)
+    cfg = config.load_config()
+    cfg["role"] = "display"
+    config.save_config(cfg)
+    library.add_url("https://docs.google.com/presentation/d/e/2PACX-good/pub", 30)
+    for bad in BAD_LINKS:
+        library.add_url(bad, 30)
+    monkeypatch.setattr(net, "_resolves", lambda h: True)
+    monkeypatch.setattr(net, "_fetch", lambda u: (u, 200))
+    client = TestClient(create_app())
+    r = client.get("/api/screen-data")
+    assert r.status_code == 200
+    data = r.json()
+    deck = next(i["src"] for i in data["items"] if "2PACX-good" in i["src"])
+    assert deck not in data["blocked"] and len(data["blocked"]) == len(BAD_LINKS)
+
+    def broken(*a, **k):
+        raise RuntimeError("something unexpected")
+    monkeypatch.setattr(net, "problems", broken)
+    r = client.get("/api/screen-data")                    # a check that blows up still answers
+    assert r.status_code == 200 and deck in r.json()["blocked"]

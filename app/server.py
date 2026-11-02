@@ -91,6 +91,17 @@ def _startup_left():
     return None if on is None else max(0, min(STARTUP_SCREEN, STARTUP_SCREEN_UNTIL - on))
 
 
+_check_errors: set = set()   # what has already been written to the journal
+
+
+def _note_check_error(exc: Exception) -> None:
+    """One journal line per kind of failure, not one per screen poll."""
+    what = f"{type(exc).__name__}: {exc}"
+    if what not in _check_errors and len(_check_errors) < 50:
+        _check_errors.add(what)
+        print(f"screen: could not check the playlist's links ({what})", file=sys.stderr, flush=True)
+
+
 def _fetched_over_network(item: dict) -> bool:
     """Does showing this item need the internet? The same test as needsNet() on the
     screen: links, decks and YouTube always; a video only when it is a web link."""
@@ -537,8 +548,14 @@ def create_app() -> FastAPI:
         remote = [i.get("src", "") for i in items if _fetched_over_network(i)]
         since_on = _seconds_since_power_on()
         starting = since_on is not None and since_on < net.STARTUP_GRACE
-        blocked = (net.problems(remote, online=discovery.has_address(), starting=starting)
-                   if remote else {})
+        try:
+            blocked = (net.problems(remote, online=discovery.has_address(), starting=starting)
+                       if remote else {})
+        except Exception as exc:
+            # A check that went wrong must never cost the screen its playlist: hold back
+            # what needs the network, play the rest, and say so once in the journal.
+            _note_check_error(exc)
+            blocked = {u: "couldn't check this link" for u in remote if isinstance(u, str)}
         problem = next(iter(blocked.values()), "")
         return {
             "items": items,
