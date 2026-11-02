@@ -141,6 +141,12 @@ def _note_online(online: bool, now: float) -> None:
 # per screen poll.
 PROBE_CACHE_SECONDS = 900
 PROBE_TIMEOUT = 6.0
+# Google can also answer 200 with its own error page where the deck should be: "Google
+# Docs encountered an error. Please try reloading this page..." - same title, no slides.
+# Only what came back gives it away. That page is about 200 KB with the message near its
+# end, and a deck runs to megabytes, so the first megabyte is enough to tell them apart.
+_GOOGLE_ERROR = b"Google Docs encountered an error"
+PROBE_READ_BYTES = 1 << 20
 _UA = ("Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) "
        "Chrome/154.0.0.0 Safari/537.36")
 _probe_cache: dict = {}  # url -> (checked_at, ok, reason)
@@ -176,12 +182,19 @@ class _RedirectFailed(Exception):
     """Google answered with a redirect, and where it pointed couldn't be reached."""
 
 
+class _ErrorPage(Exception):
+    """Google answered 200, but with its own error page in place of the deck."""
+
+
 def _fetch(url: str):
     """(final_url, status) for a GET that follows redirects. Split out so tests can
-    stand in for Google. Raises on network failure."""
+    stand in for Google. Raises on network failure, and _ErrorPage for Google's own
+    error page."""
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
     try:
         with _opener.open(req, timeout=PROBE_TIMEOUT) as resp:
+            if _GOOGLE_ERROR in resp.read(PROBE_READ_BYTES):
+                raise _ErrorPage()
             return resp.geturl(), resp.status
     except urllib.error.HTTPError as e:
         with e:
@@ -243,6 +256,12 @@ def probe(url: str, now: float = None, starting: bool = False):
             # (a filter that intercepts secure connections, say). Google had the request,
             # so this waits as long as an answer would, and it counts.
             ok, reason = False, "Google sent the deck somewhere this screen can't reach"
+            keep = PROBE_CACHE_SECONDS
+        except _ErrorPage:
+            # On the screen that page would stay until the deck is next loaded, a quarter
+            # of an hour for a deck playing alone. Google's own advice is to come back in
+            # a few minutes, so this waits as long as any answer does.
+            ok, reason = False, "Google sent an error page instead of the deck"
             keep = PROBE_CACHE_SECONDS
         except Exception as exc:
             # Google had the request, but the answer was too slow or was cut off. That
