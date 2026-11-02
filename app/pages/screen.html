@@ -485,10 +485,9 @@
       } else if (item.youtube) {
         playYouTube(idx, single);
       } else if (layers[idx] && layers[idx].slides) {
-        // A deck that is the only thing that can be shown just now plays like a lone
-        // deck - loaded once and re-mounted every 15 minutes - rather than being loaded
-        // from Google again on every turn of a playlist whose other items are waiting.
-        playSlidesDeck(idx, single || items.filter(canShow).length === 1);
+        // A deck that is the only thing that can be shown just now is not loaded from
+        // Google again on every turn of a playlist whose other items are waiting.
+        playSlidesDeck(idx, single, !single && items.filter(canShow).length === 1);
       } else {
         playPage(idx, single);
       }
@@ -535,7 +534,7 @@
     // cycling on its own, so it never parks on the last slide. On a multi-item
     // playlist we move on after the whole-deck duration; a lone deck just loops (no
     // reload, so no black gap). We keep the previous layer up until it has loaded.
-    function playSlidesDeck(idx, single) {
+    function playSlidesDeck(idx, single, alone) {
       const entry = layers[idx];
       const iframe = entry.el.querySelector('iframe');
       let done = false;
@@ -544,7 +543,8 @@
         done = true;
         clearPendingSlide();
         revealLayer(idx);
-        if (!single) cycleTimer = setTimeout(advance, dur(entry.item));
+        if (alone) stayAlone(idx);
+        else if (!single) cycleTimer = setTimeout(advance, dur(entry.item));
         // A lone deck used to load exactly once and never again, so whatever Google
         // served at that instant — including its intermittent sign-in wall — stayed on
         // the screen until someone restarted the kiosk. The frame is cross-origin, so
@@ -559,6 +559,22 @@
       // page. Google ignores the parameter; the saved link is never changed by this.
       iframe.src = entry.src + (entry.src.includes('?') ? '&' : '?') + 'r=' + Date.now();
       pendingSlide = { iframe, timer: setTimeout(go, 3500) };  // fail-safe if onload never fires
+    }
+
+    // A deck that is the only thing in its playlist that can be shown just now. It
+    // plays on like a lone deck, without being loaded from Google again, but hands back
+    // at the end of a turn as soon as anything else can be shown; after 15 minutes
+    // alone it is mounted afresh, as a lone deck would be.
+    function stayAlone(idx) {
+      const since = performance.now();
+      const turn = dur(layers[idx].item);
+      const check = () => {
+        if (items.some((it, i) => i !== idx && canShow(it, i))) { advance(); return; }
+        const left = LONE_DECK_REMOUNT_MS - (performance.now() - since);
+        if (left <= 0) { playCurrent(); return; }
+        cycleTimer = setTimeout(check, Math.min(turn, left));
+      };
+      cycleTimer = setTimeout(check, Math.min(turn, LONE_DECK_REMOUNT_MS));
     }
 
     // A video: play it through and advance when it ends (or loop it if it's the
