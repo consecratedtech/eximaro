@@ -713,10 +713,10 @@
       ytListen(iframe);
       ytBeat = setInterval(() => {
         if (entry.ytAlive || !iframe.isConnected) { clearInterval(ytBeat); ytBeat = null; return; }
-        // Every 0.6 s for about 10 s, then every 3 s, so a player that is slow to start
-        // still hears it and can say it is playing.
+        // Every 0.6 s for the 12 s a player has to answer in, then every 3 s, so a player
+        // that is slow to start still hears it in time and can say it is playing.
         tries += 1;
-        if (tries <= 15 || tries % 5 === 0) ytListen(iframe);
+        if (tries <= 20 || tries % 5 === 0) ytListen(iframe);
       }, 600);
     }
 
