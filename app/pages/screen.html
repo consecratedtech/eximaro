@@ -446,8 +446,19 @@
     // from the card to an item that is still loading shows neither a black stage nor
     // what was on screen before the card.
     function revealLayer(idx) {
-      layers.forEach((e, n) => e.el.classList.toggle('active', n === idx));
+      layers.forEach((e, n) => {
+        e.el.classList.toggle('active', n === idx);
+        if (n !== idx && e.unload) unloadFrame(e);
+      });
       netwait.style.display = 'none';
+    }
+    // Empty the frame of a YouTube video the screen gave up on. Pausing it isn't enough:
+    // a player that comes up late never heard the pause, and would play on out of sight,
+    // with sound if it has any. Its next try loads it afresh.
+    function unloadFrame(e) {
+      e.unload = false;
+      const f = e.el.querySelector('iframe');
+      if (f) { f.onload = null; f.src = 'about:blank'; }
     }
     function advance() {
       pos = (pos + 1) % order.length;
@@ -647,6 +658,7 @@
       entry.ytAlive = false;
       entry.ytCcDone = false;
       entry.ytWaiting = false;
+      entry.unload = false;
       // It was silent last time: show it only once its player answers. Until then it is
       // tried behind another item that is on screen and can be shown, or else under the
       // waiting card - never over a bare stage, which is black, nor behind an item that
@@ -687,7 +699,14 @@
       ytTimer = setTimeout(() => {
         if (entry.ytAlive) return;
         entry.failedAt = performance.now();
-        if (items.some(canShow)) { advance(); return; }
+        if (items.some(canShow)) {
+          // Moving on: its frame is emptied - once the next item is on screen, if this
+          // one is what is showing, so the change never goes through a black stage.
+          entry.unload = true;
+          if (!entry.el.classList.contains('active')) unloadFrame(entry);
+          advance();
+          return;
+        }
         entry.ytWaiting = true;
         netwait.style.display = 'flex';
         const wait = () => {
