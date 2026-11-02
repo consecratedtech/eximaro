@@ -195,6 +195,7 @@
     let cycleTimer = null;   // advances items, and slides WITHIN a pptx slideshow
     let pendingSlide = null; // {iframe, timer}: a Google Slides reload still loading
     let ytBeat = null;       // resends the YouTube API handshake until the player answers
+    let ytTimer = null;      // gives a YouTube player 12 s to answer
 
     function dur(item) { return Math.max(3, item.seconds || 10) * 1000; }
 
@@ -405,6 +406,7 @@
     function clearTimers() {
       if (cycleTimer) { clearTimeout(cycleTimer); cycleTimer = null; }
       if (ytBeat) { clearInterval(ytBeat); ytBeat = null; }
+      if (ytTimer) { clearTimeout(ytTimer); ytTimer = null; }
       clearPendingSlide();
       layers.forEach(e => {
         e.ytWaiting = false;          // only the video being played may take a card down
@@ -642,6 +644,13 @@
       entry.ytAlive = false;
       entry.ytCcDone = false;
       entry.ytWaiting = false;
+      // It was silent last time: show it only once its player answers - under the
+      // waiting card if nothing else can be shown, else behind what is on screen now.
+      const retry = !!entry.failedAt;
+      if (retry && !items.some((it, i) => i !== idx && canShow(it, i))) {
+        entry.ytWaiting = true;
+        netwait.style.display = 'flex';
+      }
       // A lone video loops seamlessly via YouTube's own loop (no API round-trip), so
       // it can't get stuck on the end screen if a message is missed. A video in a
       // list must NOT loop — native loop suppresses the "ended" event we advance on.
@@ -653,27 +662,39 @@
       // Keep the previous layer up until the video has (re)loaded, so switching to
       // it crossfades instead of flashing black — same trick as the Slides deck.
       let shown = false;
-      const go = () => { if (shown) return; shown = true; clearPendingSlide(); revealLayer(idx); ytHandshake(iframe, entry); };
+      const go = () => {
+        if (shown) return;
+        shown = true;
+        clearPendingSlide();
+        if (!retry) revealLayer(idx);
+        ytHandshake(iframe, entry);
+      };
       iframe.onload = go;
       iframe.src = src;                               // reassigning src restarts from the top
       pendingSlide = { iframe, timer: setTimeout(go, 3500) };  // reveal anyway if onload never fires
-      if (single) {
-        // A lone video loops itself. If it hasn't reported life after 12 s (offline,
-        // blocked, removed), the waiting card goes up instead of a black frame - not
-        // the set-up screen, because something IS set up. The handshake keeps going,
-        // so a slow player that answers later takes the card down again (see the
-        // message handler), and the video is mounted afresh after a while if it never does.
-        cycleTimer = setTimeout(() => {
-          if (entry.ytAlive) return;
-          entry.ytWaiting = true;
-          netwait.style.display = 'flex';
-          cycleTimer = setTimeout(playCurrent, LONE_DECK_REMOUNT_MS);
-        }, 12000);
-      } else {
-        // Bridge until the video reports its length; the first report retunes this
-        // to the real time remaining. If no report ever comes, skip, don't freeze.
-        cycleTimer = setTimeout(advance, 30000);
-      }
+      // A video that hasn't reported life after 12 s (offline, blocked, removed) is left
+      // alone for 15 minutes (see canShow), and anything else that can be shown takes
+      // over. With nothing else, the waiting card goes up instead of a black frame or an
+      // error page - not the set-up screen, because something IS set up. The handshake
+      // keeps going under the card, so a slow player that answers later takes it down
+      // (see the message handler); otherwise the video is mounted afresh after the wait.
+      ytTimer = setTimeout(() => {
+        if (entry.ytAlive) return;
+        entry.failedAt = performance.now();
+        if (items.some(canShow)) { advance(); return; }
+        entry.ytWaiting = true;
+        netwait.style.display = 'flex';
+        const wait = () => {
+          if (items.some(canShow)) { advance(); return; }   // something else - or this one again
+          cycleTimer = setTimeout(wait, 4000);
+        };
+        clearTimeout(cycleTimer);
+        cycleTimer = setTimeout(wait, 4000);
+      }, 12000);
+      // Bridge until the video reports its length; the first report retunes this to the
+      // real time remaining. If no report ever comes, skip, don't freeze. A lone video
+      // loops itself and needs none.
+      if (!single) cycleTimer = setTimeout(advance, 30000);
     }
 
     // Open the postMessage channel. A single {event:'listening'} can land before the
@@ -706,11 +727,12 @@
       const iframe = entry.el.querySelector('iframe');
       if (!iframe || ev.source !== iframe.contentWindow) return;
       entry.ytAlive = true;                           // the player is answering — it's really playing
-      if (entry.ytWaiting) {                          // a slow lone video answered after all
-        entry.ytWaiting = false;
-        netwait.style.display = 'none';
-        clearTimeout(cycleTimer);                     // no need to mount it afresh
-        cycleTimer = null;
+      if (entry.failedAt || entry.ytWaiting) {        // a slow or once-silent player answered: show it
+        entry.failedAt = 0;
+        revealLayer(idx);
+        if (entry.ytWaiting) { entry.ytWaiting = false; netwait.style.display = 'none'; }
+        clearTimeout(cycleTimer);                     // a lone video loops itself; in a list, time it again
+        cycleTimer = entry.ytSingle ? null : setTimeout(advance, 30000);
       }
 
       // Captions off: a muted YouTube video auto-shows captions, and cc_load_policy=0
