@@ -239,6 +239,13 @@
           }
           setupEl.style.display = 'flex';
           pair.style.display = 'none';
+          // Hosting its own setup network, the device has no internet. So nothing that
+          // needs it is loaded behind this screen, where it could only come back as an
+          // error page once setup is done; and a web page is loaded again before it is
+          // next shown.
+          contentReachable = false;
+          blocked = null;
+          layers.forEach(e => { if (e.page) e.stale = true; });
           return;   // setup takes over; skip the address / pairing / content logic
         }
         setupEl.style.display = 'none';
