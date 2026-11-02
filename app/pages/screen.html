@@ -241,11 +241,11 @@
           pair.style.display = 'none';
           // Hosting its own setup network, the device has no internet. So nothing that
           // needs it is loaded behind this screen, where it could only come back as an
-          // error page once setup is done; and a web page is loaded again before it is
-          // next shown.
+          // error page once setup is done; and a web page that needs it is loaded again
+          // before it is next shown.
           contentReachable = false;
           blocked = null;
-          layers.forEach(e => { if (e.page) e.stale = true; });
+          layers.forEach(e => { if (e.page && !reachableNow(e.item)) e.stale = true; });
           return;   // setup takes over; skip the address / pairing / content logic
         }
         setupEl.style.display = 'none';
@@ -428,13 +428,21 @@
       });
     }
     // Does showing this item require the internet? Uploads (images, pptx slideshows,
-    // uploaded video) are served by this device and always playable; links, Google
-    // Slides, YouTube and a remote video URL are not.
+    // uploaded video) are served by this device and always playable, and so is a link
+    // to the device itself; links, Google Slides, YouTube and a remote video URL are not.
     function needsNet(it) {
       if (!it) return false;
-      if (it.type === 'url') return true;
-      if (it.type === 'video') return /^https?:/i.test(it.src || '');
+      if (it.type === 'url') return !onDevice(it.src);
+      if (it.type === 'video') return /^https?:/i.test(it.src || '') && !onDevice(it.src);
       return false;
+    }
+    // A link to this device itself: localhost, 127.x.x.x or [::1], as the browser reads
+    // it - the links the server never holds back either (net._is_local).
+    function onDevice(src) {
+      let host;
+      try { host = new URL(src).hostname; } catch (e) { return false; }
+      return host === 'localhost' || host.endsWith('.localhost')
+          || /^127\.\d+\.\d+\.\d+$/.test(host) || host === '[::1]';
     }
     // Can what this item fetches over the internet be reached right now, as far as the
     // server knows (see loadData)? Always, for a local item.
