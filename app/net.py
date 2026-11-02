@@ -16,6 +16,7 @@ playlist is entirely local, so an offline-only sign stays completely silent.
 """
 
 import ipaddress
+import re
 import socket
 import threading
 import time
@@ -146,7 +147,8 @@ _probe_cache: dict = {}  # url -> (checked_at, ok, reason)
 
 
 def is_slides(url: str) -> bool:
-    return "docs.google.com/presentation" in (url or "")
+    link = web_link(url)
+    return isinstance(link, str) and "docs.google.com/presentation" in link
 
 
 def _to_sign_in(url: str) -> bool:
@@ -225,7 +227,7 @@ def probe(url: str, now: float = None, starting: bool = False):
     try:
         counts = True
         try:
-            ok, reason = _judge(*_fetch(url))
+            ok, reason = _judge(*_fetch(web_link(url)))
             keep = PROBE_CACHE_SECONDS
         except urllib.error.URLError as exc:
             # The request never got to Google: the name didn't resolve, or no connection
@@ -262,13 +264,41 @@ def last_probe(url: str):
     return (hit[1], hit[2]) if hit else None
 
 
+# A web address the way the screen's browser reads it. Chromium forgives what Python's
+# parser does not: "Https:", any number of slashes after it, a backslash for a slash,
+# capitals in the host name, a line break pasted into the middle.
+_WEB_LINK = re.compile(r"(https?):[/\\]*([^/\\?#]*)([^?#]*)(.*)", re.I)
+_C0_OR_SPACE = "".join(map(chr, range(33)))
+
+
+def web_link(url):
+    """An http(s) link written the way the screen will ask for it, so a check looks at
+    the host the screen actually loads. Read strictly, "https:///docs.google.com/..."
+    has no host at all and passes for content this device serves itself: never looked
+    up, never asked of Google, though the screen goes to the internet for it. Anything
+    that isn't an http(s) link comes back unchanged."""
+    if not isinstance(url, str):
+        return url
+    m = _WEB_LINK.fullmatch(re.sub(r"[\t\n\r]", "", url.strip(_C0_OR_SPACE)))
+    if not m:
+        return url
+    scheme, auth, path, rest = m.groups()
+    user, at, host = auth.rpartition("@")
+    path = path.replace("\\", "/")
+    return f"{scheme.lower()}://{user}{at}{host.lower()}{path}{rest}"
+
+
 def host_of(url: str) -> str:
     """The hostname an item will be fetched from, or '' for a local/relative one
     (an uploaded image or video is served by this device and always reachable).
     Raises ValueError for a web link that can't be read at all."""
-    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+    link = web_link(url)
+    if not isinstance(link, str) or not link.startswith(("http://", "https://")):
         return ""
-    return (urlsplit(url).hostname or "").lower()
+    host = (urlsplit(link).hostname or "").lower()
+    if not host:
+        raise ValueError("a web link with no host name")    # "https://": nothing to fetch
+    return host
 
 
 def _resolves(host: str) -> bool:

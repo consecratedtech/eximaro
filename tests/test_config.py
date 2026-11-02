@@ -762,3 +762,57 @@ def test_screen_data_survives_a_link_that_cannot_be_read(monkeypatch):
     monkeypatch.setattr(net, "problems", broken)
     r = client.get("/api/screen-data")                    # a check that blows up still answers
     assert r.status_code == 200 and deck in r.json()["blocked"]
+
+
+# Chromium loads a link like this from the internet, as if it were written properly.
+LOOSE_DECK = "https:///docs.google.com/presentation/d/e/2PACX-loose/embed"   # a slash too many
+
+
+def test_a_loosely_written_link_is_checked_as_the_screen_reads_it(monkeypatch):
+    # Read strictly, the link above has no host at all and passes for content this
+    # device serves itself: never looked up and never asked of Google, so an outage or
+    # a sign-in wall went straight onto the screen.
+    from app import net
+    bs = chr(92)
+    assert net.web_link(LOOSE_DECK) == "https://docs.google.com/presentation/d/e/2PACX-loose/embed"
+    assert net.web_link("Https:Docs.Google.com" + bs + "presentation?x=" + bs) == \
+        "https://docs.google.com/presentation?x=" + bs                     # backslash kept in the query
+    assert net.web_link(" https://docs.goo\ngle.com/x ") == "https://docs.google.com/x"
+    normal = "https://docs.google.com/presentation/d/e/X/embed?start=true&loop=true"
+    assert net.web_link(normal) == normal                                 # a normal link is untouched
+    assert net.web_link("/asset/abc.png") == "/asset/abc.png" and net.web_link(None) is None
+    assert net.host_of(LOOSE_DECK) == "docs.google.com"
+    assert net.host_of("https://evil.example" + bs + "@docs.google.com/x") == "evil.example"  # where it goes
+    assert net.is_slides("HTTPS://DOCS.GOOGLE.COM/presentation/d/e/X/embed")
+
+    net.reset_cache()
+    monkeypatch.setattr(net, "_resolves", lambda h: True)
+    fetched = []
+    monkeypatch.setattr(net, "_fetch", lambda u: (fetched.append(u), (u, 401))[1])
+    assert "sign in" in net.problems([LOOSE_DECK])[LOOSE_DECK]           # asked of Google: refused
+    assert fetched == ["https://docs.google.com/presentation/d/e/2PACX-loose/embed"]
+    assert net.problems([LOOSE_DECK], online=False) == {LOOSE_DECK: "no network yet"}
+    for hostless in ("https://", "https:///", "https://user@/x"):         # nothing the screen could load
+        assert "web address" in net.problems([hostless])[hostless]
+
+
+def test_screen_data_holds_back_a_loosely_written_deck_too(monkeypatch):
+    # With no internet, a deck saved with a slash too many is held back like the
+    # normal one next to it, rather than being the one item left to play: Chromium's
+    # error page.
+    from fastapi.testclient import TestClient
+    from app import discovery, library, net
+    from app.server import create_app
+    net.reset_cache()
+    monkeypatch.setattr(discovery, "advertise", lambda *a, **k: None)
+    monkeypatch.setattr(discovery, "has_address", lambda: True)
+    cfg = config.load_config()
+    cfg["role"] = "display"
+    config.save_config(cfg)
+    library.add_url("https://docs.google.com/presentation/d/e/2PACX-good/pub", 30)
+    library._append({"id": "loose001", "type": "url", "ref": LOOSE_DECK, "seconds": 30,
+                     "name": "Google Slides"})                 # saved before links were tidied
+    monkeypatch.setattr(net, "_resolves", lambda h: False)
+    data = TestClient(create_app()).get("/api/screen-data").json()
+    assert LOOSE_DECK in data["blocked"] and len(data["blocked"]) == 2
+    assert data["blocked"][LOOSE_DECK] == "no network yet"
