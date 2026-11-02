@@ -442,8 +442,12 @@
       if (e && e.failedAt && performance.now() - e.failedAt < FAILED_WAIT_MS) return false;
       return reachableNow(it);
     }
+    // Put item idx on screen. This is also what takes the waiting card down, so going
+    // from the card to an item that is still loading shows neither a black stage nor
+    // what was on screen before the card.
     function revealLayer(idx) {
       layers.forEach((e, n) => e.el.classList.toggle('active', n === idx));
+      netwait.style.display = 'none';
     }
     function advance() {
       pos = (pos + 1) % order.length;
@@ -479,7 +483,6 @@
         cycleTimer = setTimeout(playCurrent, 4000);                   // cleared by clearTimers
         return;
       }
-      netwait.style.display = 'none';
       if (item.type === 'slideshow') {
         playSlideshow(idx, single);
       } else if (item.type === 'video') {
@@ -644,10 +647,13 @@
       entry.ytAlive = false;
       entry.ytCcDone = false;
       entry.ytWaiting = false;
-      // It was silent last time: show it only once its player answers - under the
-      // waiting card if nothing else can be shown, else behind what is on screen now.
+      // It was silent last time: show it only once its player answers. Until then it is
+      // tried behind another item that is on screen and can be shown, or else under the
+      // waiting card - never over a bare stage, which is black, nor behind an item that
+      // failed or can't be reached, which may be holding an error page.
       const retry = !!entry.failedAt;
-      if (retry && !items.some((it, i) => i !== idx && canShow(it, i))) {
+      if (retry && !layers.some((e, i) => i !== idx && e.el.classList.contains('active')
+                                       && canShow(e.item, i))) {
         entry.ytWaiting = true;
         netwait.style.display = 'flex';
       }
