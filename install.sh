@@ -694,6 +694,41 @@ WantedBy=multi-user.target
 EOF
 ok "${APP}.service installed (auto-restart, sandboxed, can only write ${DATA_DIR})"
 
+# ---- kiosk add-on: what Google sent into a deck's frame ---------------------
+# Now and then Google answers a published deck with its own error page ("Google Docs
+# encountered an error...") as if all were well, and the screen, outside the deck's
+# frame, cannot tell that from the deck - so the error page went up on the sign and
+# stayed there for the deck's whole turn. This small Chromium add-on looks inside the
+# frame and tells the screen which one came; the screen then keeps up what it has and
+# asks Google again. Optional by design: without it the screen behaves as it always has,
+# and Chromium passes over an add-on folder that is missing or broken without a word on
+# the screen. So a copy that doesn't check out is just left off the kiosk's command line.
+step "Installing the kiosk add-on"
+KIOSK_EXT_DIR="/usr/share/${APP}/kiosk-ext"
+KIOSK_EXT_ARGS=""
+# A subshell with `|| exit 1` on every step: set -e is suspended in a function called
+# from an `if`, so leaning on it would report success past a failed step.
+install_kiosk_ext() (
+  install -d -m 0755 "$KIOSK_EXT_DIR" || exit 1
+  for _f in manifest.json screen.js deck.js; do
+    [ -s "${SRC_DIR}/kiosk-ext/${_f}" ] || exit 1
+    cp "${SRC_DIR}/kiosk-ext/${_f}" "${KIOSK_EXT_DIR}/${_f}.new" || exit 1
+    chmod 0644 "${KIOSK_EXT_DIR}/${_f}.new" || exit 1
+  done
+  python3 -m json.tool "${KIOSK_EXT_DIR}/manifest.json.new" >/dev/null 2>&1 || exit 1
+  for _f in manifest.json screen.js deck.js; do
+    mv -f "${KIOSK_EXT_DIR}/${_f}.new" "${KIOSK_EXT_DIR}/${_f}" || exit 1
+  done
+)
+if install_kiosk_ext; then
+  KIOSK_EXT_ARGS="--load-extension=${KIOSK_EXT_DIR}"
+  ok "kiosk add-on installed (${KIOSK_EXT_DIR})"
+else
+  rm -f "${KIOSK_EXT_DIR}"/*.new 2>/dev/null || true
+  warn "the kiosk add-on did not install - the screen works without it, but Google's"
+  warn "error page can show in place of a deck until it does"
+fi
+
 # kiosk: cage launches Chromium fullscreen pointing at the LOCAL screen page.
 # the app serves http://localhost:PORT/screen which renders this device's cached playlist.
 cat > "/etc/systemd/system/${APP}-kiosk.service" <<EOF
@@ -751,13 +786,19 @@ ExecStartPre=/bin/sh -c 'for i in \$(seq 1 60); do curl -sf http://localhost:${W
 # runtime dir — which the app user cannot write; Chromium then silently fell back to
 # a home-dir profile, so it "worked" on any device whose app-user home was writable
 # and hard-crash-looped on one where it wasn't.)
+# That profile is thrown away whenever the kiosk stops, so nothing persists across a
+# restart or a boot, and the browser runs in its ordinary mode: incognito would add
+# nothing to that, and it switches the kiosk add-on off. The profile lives in memory,
+# so its cache is kept small (64 MB).
 RuntimeDirectory=${APP}-kiosk
 RuntimeDirectoryMode=0700
 ExecStart=/usr/bin/cage -- ${CHROMIUM_PKG} \\
-  --kiosk --noerrdialogs --disable-infobars --incognito \\
+  --kiosk --noerrdialogs --disable-infobars \\
+  --no-first-run --no-default-browser-check \\
   --check-for-update-interval=31536000 \\
   --autoplay-policy=no-user-gesture-required \\
   --user-data-dir=/run/${APP}-kiosk/chromium \\
+  --disk-cache-size=67108864 ${KIOSK_EXT_ARGS} \\
   http://localhost:${WEB_PORT}/screen
 Restart=always
 RestartSec=3
@@ -768,18 +809,17 @@ EOF
 ok "${APP}-kiosk.service installed (cage + ${CHROMIUM_PKG}, boots straight to fullscreen)"
 
 # ---- let embedded content keep its cookies ----------------------------------
-# The kiosk runs Chromium in --incognito (nothing persists across boots, by
-# design), and incognito blocks THIRD-PARTY cookies. A Google Slides deck on the
-# screen is exactly that: Google, framed inside our localhost page. When the embed
-# finds it cannot set a cookie, Google paints its own "Allow cookies" interstitial
-# over the deck and waits for a click that never comes on a sign. Seen twice on
-# customer screens. Intermittent because Google serves the prompt on some sessions
-# only, and the deck is re-mounted at slide 1 every cycle, so each cycle is a
+# A Google Slides deck on the screen is a THIRD-PARTY frame: Google, framed inside our
+# localhost page. When the embed finds it cannot set a cookie, Google paints its own
+# "Allow cookies" interstitial over the deck and waits for a click that never comes on
+# a sign. Seen twice on customer screens, back when the kiosk ran in incognito, which
+# blocks third-party cookies. Intermittent because Google serves the prompt on some
+# sessions only, and the deck is re-mounted at slide 1 every cycle, so each cycle is a
 # fresh roll of the dice.
 #
-# A managed policy is the right lever: it applies in incognito too, so nothing
-# starts persisting; it says what we mean instead of leaning on a Chromium default
-# that could change under us; and it survives flag edits. It goes in the policy
+# A managed policy is the right lever: it applies in any browser mode; it says what we
+# mean instead of leaning on a Chromium default that could change under us; and it
+# survives flag edits. It goes in the policy
 # directory of the chromium package actually installed - this binary reads exactly
 # /etc/chromium/policies (checked with strings on trixie), so guessing at both
 # package spellings is unnecessary. Auto-clicking the button from screen.html is

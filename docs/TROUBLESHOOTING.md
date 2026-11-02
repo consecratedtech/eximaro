@@ -86,6 +86,7 @@ Look at the very start of the output:
 - ⚠️ **`"pairing_code":"ABCD"`** (not null) — the device is a **display waiting to be paired**. Enter that code on the controller's panel to link it.
 - ⚠️ **`"wifi_setup":{…}`** — the device has no working network and is showing its Wi‑Fi setup screen → section 5.
 - ⚠️ **The TV shows a Google "Allow cookies" button over a Slides deck** — that is Google's own prompt inside the embed, not Eximaro, and it means the device is on a version from before the cookie policy was added. Run the full update (`sudo eximaro-update-full`): it installs a Chromium policy that lets embedded Google content keep its cookies, and the prompt can no longer appear.
+- ⚠️ **The TV shows "Google Docs encountered an error…" where a deck should be** — Google now and then sends that page instead of the deck. The kiosk add-on spots it, keeps the error off the screen and asks Google again; seeing it on the TV means the device doesn't have the add-on yet. Run the full update (`sudo eximaro-update-full` — the panel's "Update now" doesn't install it). To check: `ls /usr/share/eximaro/kiosk-ext` lists `deck.js manifest.json screen.js`, and `systemctl cat eximaro-kiosk.service | grep load-extension` prints a line.
 
 ---
 

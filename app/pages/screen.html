@@ -190,6 +190,12 @@
     const pageStart = performance.now();
     const LONE_DECK_REMOUNT_MS = 15 * 60 * 1000;  // how long a bad load can last on a one-deck playlist
     const FAILED_WAIT_MS = 15 * 60 * 1000;  // a video that wouldn't play is left alone this long
+    // A deck Google answered with its error page is asked for again after these waits,
+    // for about two minutes in all; then it is left alone for FAILED_WAIT_MS.
+    const DECK_RETRY_MS = [5000, 20000, 40000, 60000];
+    const DECK_TRY_MS = 2 * 60 * 1000;
+    let serverNote = '';   // why the server says content can't be shown yet, if it does
+    let screenNote = '';   // why the screen itself is holding a deck back, if it is
     // The kiosk add-on has recognised a drawn deck on this screen. From then on its
     // 'unknown' - or no word at all - means a load went wrong; until then, it may simply
     // not know the page (see playSlidesDeck).
@@ -313,10 +319,8 @@
         layers.forEach(e => { if (e.page && !reachableNow(e.item)) e.stale = true; });
         // The server says WHY when it can't be shown ("no network yet", or Google asking
         // viewers to sign in). Show that, so a sign-in wall is never misread as wifi.
-        const why = document.getElementById('netwaitWhy');
-        if (why) why.textContent = data.content_note
-          ? ('Not showing it yet: ' + data.content_note + '. Retrying.')
-          : 'This screen starts as soon as it can reach your content.';
+        serverNote = data.content_note || '';
+        showWhy();
         hold(!!data.pairing_code);
 
         const sig = JSON.stringify({ i: data.items || [], s: !!data.shuffle });
@@ -347,9 +351,18 @@
       } catch (e) { /* keep showing what we have if a fetch fails */ }
     }
 
+    // What the waiting card says about why it is up.
+    function showWhy() {
+      const why = document.getElementById('netwaitWhy');
+      const note = serverNote || screenNote;
+      if (why) why.textContent = note
+        ? ('Not showing it yet: ' + note + '. Retrying.')
+        : 'This screen starts as soon as it can reach your content.';
+    }
+
     // Build the DOM layer for one item: an <img> (image / pptx slideshow) or an
-    // <iframe> (web page / Google Slides).
-    function buildLayer(item) {
+    // <iframe> (web page / Google Slides). A bare one is left empty, for the caller to load.
+    function buildLayer(item, bare) {
       const layer = document.createElement('div');
       layer.className = 'layer';
       let el;
@@ -368,7 +381,7 @@
         el = document.createElement('iframe');
         // A YouTube video is loaded when its turn comes (playYouTube), never before:
         // loaded here, it would start playing out of sight, with sound if it has any.
-        if (!item.youtube) el.src = embedSrc(item.src);
+        if (!item.youtube && !bare) el.src = embedSrc(item.src);
         el.allow = 'autoplay; fullscreen';
         if (isSlides(item.src)) el.className = 'slides';
       }
@@ -434,7 +447,14 @@
     }
 
     function clearPendingSlide() {
-      if (pendingSlide) { clearTimeout(pendingSlide.timer); pendingSlide.iframe.onload = null; pendingSlide = null; }
+      if (pendingSlide) {
+        clearTimeout(pendingSlide.timer);
+        pendingSlide.iframe.onload = null;
+        // A fresh copy of a deck that never went up goes with it (see playSlidesDeck).
+        const el = pendingSlide.el;
+        if (el && el.parentNode) el.parentNode.removeChild(el);
+        pendingSlide = null;
+      }
     }
     function clearTimers() {
       if (cycleTimer) { clearTimeout(cycleTimer); cycleTimer = null; }
@@ -502,6 +522,7 @@
       netwait.style.display = 'none';
       coversOff();
       dropLeaving(true);
+      screenNote = '';
     }
     // The waiting card, in place of whatever was showing - and over a YouTube frame
     // waiting to be emptied, which can be emptied now.
@@ -647,30 +668,160 @@
     // reload, so no black gap). We keep the previous layer up until it has loaded.
     function playSlidesDeck(idx, single, alone) {
       const entry = layers[idx];
-      const iframe = entry.el.querySelector('iframe');
+      entry.unload = false;
+      // A deck that is on screen already (one playing alone, loaded afresh) is loaded
+      // again in a layer of its own, and the copy on screen plays on: the fresh copy takes
+      // its place only once it is known to be good - the add-on has seen the deck in it,
+      // or, without the add-on, it has loaded. A load that fails, or never says what it
+      // is, never takes the place of a deck that is playing. (A copy under the waiting
+      // card, or any other full-screen cover, is not on screen.)
+      const showing = entry.el.classList.contains('active') && !covered();
+      const el = showing ? buildLayer(entry.item, true) : entry.el;
+      if (showing) stage.appendChild(el);
+      const iframe = el.querySelector('iframe');
+      const helper = addOn();
+      // A fresh query value on every (re)mount, so the browser must actually ask Google
+      // again rather than hand back whatever it cached last time - including a sign-in
+      // page. Google ignores the parameter; the saved link is never changed by this. It
+      // also tells the add-on's answer about this load from one about an earlier load.
+      const r = String(Date.now());
       let done = false;
       const go = () => {
         if (done) return;
         done = true;
+        if (el !== entry.el) {                     // the fresh copy takes over
+          leaving.push(entry.el);
+          entry.el = el;
+          if (pendingSlide && pendingSlide.iframe === iframe) pendingSlide.el = null;
+        }
         clearPendingSlide();
+        entry.deckErrorSince = 0;
+        entry.liveR = helper ? r : null;           // a late word about this load still counts
         revealLayer(idx);
         if (alone) stayAlone(idx);
         else if (!single) cycleTimer = setTimeout(advance, dur(entry.item));
         // A lone deck used to load exactly once and never again, so whatever Google
         // served at that instant — including its intermittent sign-in wall — stayed on
-        // the screen until someone restarted the kiosk. The frame is cross-origin, so
-        // the page cannot see what is in it; the only honest remedy is to re-mount on
-        // a timer. Going through playCurrent re-checks reachability first, so a deck
-        // Google is currently refusing is held on the waiting card instead.
+        // the screen until someone restarted the kiosk. Without the add-on the page
+        // cannot see into the frame, so it is mounted afresh on a timer (which also
+        // picks up changes made to the deck). Going through playCurrent re-checks
+        // reachability first, so a deck Google is currently refusing is held on the
+        // waiting card instead.
         else cycleTimer = setTimeout(playCurrent, LONE_DECK_REMOUNT_MS);
       };
-      iframe.onload = go;
-      // A fresh query value on every (re)mount, so the browser must actually ask Google
-      // again rather than hand back whatever it cached last time - including a sign-in
-      // page. Google ignores the parameter; the saved link is never changed by this.
-      iframe.src = entry.src + (entry.src.includes('?') ? '&' : '?') + 'r=' + Date.now();
-      pendingSlide = { iframe, timer: setTimeout(go, 3500) };  // fail-safe if onload never fires
+      // The copy on screen plays on; the fresh one is dropped.
+      const keep = () => {
+        if (done) return;
+        done = true;
+        clearPendingSlide();
+        if (alone) stayAlone(idx);
+        else if (!single) advance();
+        else cycleTimer = setTimeout(playCurrent, LONE_DECK_REMOUNT_MS);
+      };
+      // Google sent something other than the deck.
+      const fail = () => {
+        if (done) return;
+        done = true;
+        clearPendingSlide();                       // takes a fresh copy away with it
+        if (!showing) iframe.src = 'about:blank';  // never to be put up as it is
+        deckError(idx, single, alone, showing);
+      };
+      // With the kiosk add-on (kiosk-ext), the deck goes up once the add-on has seen a
+      // slide drawn in the frame, and Google's error pages never do (see deckError).
+      // Until the add-on has recognised a deck at least once, a page it doesn't know is
+      // treated as it would be without the add-on - so a change on Google's side can never
+      // keep every deck off the screen. Without it, the deck goes up when the frame has
+      // loaded, whatever came.
+      const answer = (state) => {
+        if (state === 'deck') { addonProven = true; go(); return; }
+        if (state === 'error' || addonProven) { fail(); return; }
+        if (showing) keep(); else go();
+      };
+      const noAnswer = () => {
+        if (helper && addonProven) fail();
+        else if (showing) keep();
+        else go();
+      };
+      iframe.onload = helper ? null : go;
+      let src;
+      try {
+        const u = new URL(entry.src);
+        u.searchParams.set('r', r);
+        src = u.toString();
+      } catch (e) {
+        src = entry.src + (entry.src.includes('?') ? '&' : '?') + 'r=' + r;
+      }
+      iframe.src = src;
+      // Should no answer come: the add-on says 'unknown' well before its 20 s.
+      pendingSlide = { iframe, r, answer: helper ? answer : null, el: showing ? el : null,
+                       timer: setTimeout(noAnswer, helper ? 20000 : showing ? 10000 : 3500) };
     }
+
+    // Is the kiosk add-on here to say what Google sent into a deck's frame?
+    function addOn() { return document.documentElement.hasAttribute('data-eximaro-addon'); }
+
+    // Google sent its own error page where the deck should be. Asked again, it usually
+    // sends the deck, so it is asked again - for about two minutes, then left alone for a
+    // quarter of an hour, like anything else that keeps failing over the network. The
+    // screen keeps what it has meanwhile. A deck playing alone keeps playing the copy it
+    // has up and is loaded afresh at its usual time - nothing is gained by asking sooner.
+    // Otherwise anything else that can be shown plays, and with nothing else, the waiting
+    // card says why.
+    function deckError(idx, single, alone, showing) {
+      const e = layers[idx];
+      if (showing && (single || alone)) {
+        e.deckErrorSince = 0;
+        if (alone) stayAlone(idx);
+        else cycleTimer = setTimeout(playCurrent, LONE_DECK_REMOUNT_MS);
+        return;
+      }
+      const now = performance.now();
+      if (!e.deckErrorSince) { e.deckErrorSince = now; e.deckTries = 0; }
+      const wait = DECK_RETRY_MS[Math.min(e.deckTries++, DECK_RETRY_MS.length - 1)];
+      if (now - e.deckErrorSince >= DECK_TRY_MS) { e.deckErrorSince = 0; e.failedAt = now; }
+      // Something else that can be shown - and isn't a deck Google is failing on as well -
+      // plays meanwhile; this deck is asked again on its next turn.
+      if (items.some((it, i) => i !== idx && canShow(it, i) && !(layers[i] && layers[i].deckErrorSince))) {
+        advance();
+        return;
+      }
+      screenNote = 'Google sent an error page instead of the deck';
+      showWhy();
+      showCard();
+      layers.forEach(l => l.el.classList.remove('active'));
+      cycleTimer = setTimeout(playCurrent, e.failedAt === now ? 4000 : wait);
+    }
+
+    // The add-on's word came after its deck went up (a load slower than the wait for it),
+    // and it was Google's error page: dealt with as if it had come in time. The frame is
+    // emptied once it is off screen, never to be put up as it is.
+    function deckWentBad(idx) {
+      const e = layers[idx];
+      e.liveR = null;
+      e.unload = true;
+      if (!(order.length && order[pos % order.length] === idx && e.el.classList.contains('active'))) return;
+      clearTimers();
+      const single = items.length === 1;
+      deckError(idx, single, !single && items.filter(canShow).length === 1, false);
+    }
+
+    // The kiosk add-on's answer about a deck being loaded (see playSlidesDeck) - or, too
+    // late for that, about one that has gone up (see deckWentBad).
+    window.addEventListener('message', (ev) => {
+      const d = ev.data;
+      if (!d || typeof d !== 'object' || d.eximaro !== 'deck') return;
+      let r = null;
+      try { r = new URL(d.href).searchParams.get('r'); } catch (e) { return; }
+      const p = pendingSlide;
+      if (p && p.answer && ev.source === p.iframe.contentWindow) {
+        if (r === p.r) p.answer(d.state);
+        return;
+      }
+      if (d.state !== 'error') return;
+      const idx = layers.findIndex(e => e.liveR && e.liveR === r && e.el.querySelector('iframe')
+                                        && e.el.querySelector('iframe').contentWindow === ev.source);
+      if (idx >= 0) deckWentBad(idx);
+    });
 
     // A deck that is the only thing in its playlist that can be shown just now. It
     // plays on like a lone deck, without being loaded from Google again, but hands back
