@@ -17,8 +17,10 @@ doing). Hosting the setup network and joining a chosen one come next."""
 
 import json
 import os
+import re
 import shutil
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,10 +42,11 @@ CAPTIVE_TABLE = "eximaro_captive"
 CAPTIVE_RULESET = """table ip eximaro_captive {
   chain prerouting {
     type nat hook prerouting priority dstnat; policy accept;
-    iifname "wlan0" tcp dport 80 redirect to :8080
+    iifname "%s" tcp dport 80 redirect to :8080
   }
 }
 """
+DEV = "wlan0"  # the Wi-Fi device; found again on every run (see _wifi_device)
 
 
 def _nft(*args, input_text=None):
@@ -60,7 +63,7 @@ def _captive_on() -> None:
     except Exception:
         pass
     try:
-        _nft("-f", "-", input_text=CAPTIVE_RULESET)
+        _nft("-f", "-", input_text=CAPTIVE_RULESET % DEV)
     except Exception:
         pass
 
@@ -154,16 +157,51 @@ def do_scan(req=None) -> None:
     _write(SCAN, {"networks": nets, "when": _now()})
 
 
-def _has_saved_wifi() -> bool:
-    """Is there a real Wi-Fi network already configured to reconnect to (any saved
-    wireless profile that isn't our own setup Hotspot)? When there is, the device must
-    keep trying to rejoin it rather than seize the radio for the setup network."""
-    res = _nmcli("-t", "-f", "NAME,TYPE", "connection", "show", timeout=15)
+JOINING = "eximaro-joining"  # the name a join saves its network under until it has worked
+
+
+def _wifi_profiles() -> list:
+    """The saved Wi-Fi networks, as (name, uuid, has it ever connected). Raises if
+    nmcli can't say: nothing may be deleted on the strength of a list that wasn't read."""
+    res = _nmcli("-t", "-f", "NAME,UUID,TYPE,TIMESTAMP", "connection", "show", timeout=15)
+    if res.returncode != 0:
+        raise RuntimeError("could not list the saved networks")
+    out = []
     for line in res.stdout.splitlines():
         p = _split_terse(line)
-        if len(p) >= 2 and p[1] == "802-11-wireless" and p[0] != "Hotspot":
-            return True
-    return False
+        if len(p) >= 4 and p[2] == "802-11-wireless":
+            out.append((p[0], p[1], p[3] not in ("", "0")))
+    return out
+
+
+def _ssid_of(uuid: str) -> str:
+    res = _nmcli("-g", "802-11-wireless.ssid", "connection", "show", "uuid", uuid, timeout=10)
+    lines = res.stdout.splitlines() if res.returncode == 0 else []
+    return _split_terse(lines[0])[0] if lines else ""
+
+
+def _wifi_device() -> str:
+    """The Wi-Fi device: wlan0 on a Raspberry Pi, a name like wlp2s0 on other machines."""
+    try:
+        res = _nmcli("-t", "-f", "DEVICE,TYPE", "device", "status", timeout=10)
+        for line in res.stdout.splitlines():
+            p = _split_terse(line)
+            if len(p) >= 2 and p[1] == "wifi":
+                return p[0]
+    except subprocess.TimeoutExpired:
+        pass
+    return "wlan0"
+
+
+def _has_saved_wifi() -> bool:
+    """Is there a real Wi-Fi network already configured to reconnect to (any saved
+    wireless profile that isn't our own setup Hotspot, nor a join still under way)? When
+    there is, the device must keep trying to rejoin it rather than seize the radio for
+    the setup network."""
+    try:
+        return any(name not in ("Hotspot", JOINING) for name, _, _ in _wifi_profiles())
+    except RuntimeError:
+        return False
 
 
 def do_status(req=None) -> None:
@@ -207,7 +245,7 @@ def do_hotspot(req) -> None:
         return
     _set_country()
     _nmcli("connection", "delete", "Hotspot", timeout=10)  # clear any stale one first
-    r = _nmcli("device", "wifi", "hotspot", "ifname", "wlan0",
+    r = _nmcli("device", "wifi", "hotspot", "ifname", DEV,
                "ssid", ssid, "password", password, "band", "bg", timeout=30)
     ok = r.returncode == 0
     if ok:
@@ -217,32 +255,165 @@ def do_hotspot(req) -> None:
                     "error": None if ok else _scrub(r.stderr, password), "when": _now()})
 
 
+JOIN_WAIT = 75  # seconds nmcli waits for a join to finish before it gives up
+SCAN_WAIT = 25  # seconds a join waits for its network to show up in a scan first
+# Settings of its own a saved network can have, carried over when a join replaces it.
+CARRIED = ("802-11-wireless.hidden", "ipv4.method", "ipv4.addresses", "ipv4.gateway",
+           "ipv4.dns", "ipv6.method")
+
+
+def _wait_to_see(ssid: str):
+    """Wait, up to SCAN_WAIT, for `ssid` to show up in the radio's list of nearby
+    networks; says (seen, seen only once asked for by name). nmcli joins only a network
+    on that list, and the list is empty right after the setup network goes down, until
+    a scan lands - nor is it kept fresh while the radio is connected somewhere else. The
+    second half of the wait asks for the network by name as well, which is how one that
+    doesn't announce its name (a hidden network) shows up."""
+    start = time.monotonic()
+    next_scan = 0.0
+    while True:
+        now = time.monotonic()
+        by_name = now - start >= SCAN_WAIT / 2
+        if now >= next_scan:
+            # Refused when asked too soon after the last one; asking again later is fine.
+            _nmcli("device", "wifi", "rescan", "ifname", DEV, *(["ssid", ssid] if by_name else []),
+                   timeout=10)
+            next_scan = now + 5
+        res = _nmcli("-t", "-f", "SSID", "device", "wifi", "list", "ifname", DEV,
+                     "--rescan", "no", timeout=10)
+        if any(_split_terse(line)[0] == ssid for line in res.stdout.splitlines()):
+            return True, by_name
+        if time.monotonic() - start >= SCAN_WAIT:
+            return False, False
+        time.sleep(1)
+
+
+def _joined(out: str):
+    """The profile nmcli says it brought up ("... successfully activated with '<uuid>'")."""
+    m = re.search(r"activated with '([0-9a-fA-F-]{36})'", out or "")
+    return m.group(1) if m else None
+
+
+def _carry_over(old: str, new: str) -> None:
+    """A saved network's own settings - a fixed address, a hidden name - go over to the
+    copy a join made of it, which takes its place."""
+    res = _nmcli("-g", ",".join(CARRIED), "connection", "show", "uuid", old, timeout=10)
+    values = res.stdout.split("\n") if res.returncode == 0 else []
+    if len(values) < len(CARRIED):
+        return
+    args = []
+    for key, value in zip(CARRIED, values):
+        value = value.strip().replace("\\:", ":")
+        if value and not (key == "802-11-wireless.hidden" and value == "no"):
+            args += [key, value]
+    if args:
+        _nmcli("connection", "modify", "uuid", new, *args, timeout=10)
+
+
+def _settle(uuid: str, ssid: str) -> None:
+    """A join that worked: its network takes the place of any other saved copy of the
+    same network (which may hold an old password), keeping that copy's own settings; it
+    takes the network's own name; and it is retried forever on reconnect - the default
+    gives up after a few tries, which is exactly how a sign that booted before its router
+    ends up stranded offline."""
+    for name, other, _ in _wifi_profiles():
+        if other == uuid or name in ("Hotspot", JOINING) or _ssid_of(other) != ssid:
+            continue
+        _carry_over(other, uuid)
+        _nmcli("connection", "delete", "uuid", other, timeout=10)
+    # Never the setup network's name, nor a join's: profiles by those names get removed.
+    name = ssid if ssid not in ("Hotspot", JOINING) else f"{ssid} (Wi-Fi)"
+    _nmcli("connection", "modify", "uuid", uuid, "connection.id", name,
+           "connection.autoconnect", "yes", "connection.autoconnect-retries", "0", timeout=10)
+
+
+def _drop_joining(keep=None) -> None:
+    """Remove what joins saved under JOINING (but `keep`)."""
+    for name, uuid, _ in _wifi_profiles():
+        if name == JOINING and uuid != keep:
+            _nmcli("connection", "delete", "uuid", uuid, timeout=10)
+
+
+def _tidy_joining() -> None:
+    """A join cut off part-way (the power went, say) can leave its network saved under
+    JOINING. One that never connected is removed - kept, it would make this screen look
+    set up, and it would never offer the setup network again. One that did connect is
+    settled, as a join that worked (or left for next time, if its network can't be read
+    just now)."""
+    try:
+        for name, uuid, connected in _wifi_profiles():
+            if name != JOINING:
+                continue
+            if not connected:
+                _nmcli("connection", "delete", "uuid", uuid, timeout=10)
+                continue
+            ssid = _ssid_of(uuid)
+            if ssid:
+                _settle(uuid, ssid)
+    except (RuntimeError, subprocess.TimeoutExpired):
+        pass
+
+
 def do_connect(req) -> None:
     """Join a real network. The radio can't host the AP and join at the same time,
-    so drop the AP first; if the join fails, bring the AP back so they can retry."""
+    so drop the AP first; if the join fails, bring the AP back so they can retry.
+
+    The join saves its network under a name of its own (JOINING) until it has worked.
+    So a mistyped password never lands in a network already saved - re-entering the
+    network a screen is on, with a typo, must not cut it off - and a join that fails
+    leaves nothing behind: a saved network makes a screen look set up, and it would
+    never offer the setup network again, stranded until someone plugs in a cable."""
     ssid = (req.get("ssid") or "")[:64]
     password = req.get("password") or ""
     if not ssid:
         _write(STATUS, {"error": "no network name given", "when": _now()})
         return
-    _nmcli("connection", "down", "Hotspot", timeout=15)
-    args = ["device", "wifi", "connect", ssid, "ifname", "wlan0"]
-    if password:
-        args += ["password", password]
-    r = _nmcli(*args, timeout=45)
-    if r.returncode == 0:
+    joined, detail, out = False, "", ""
+    try:
+        _nmcli("connection", "down", "Hotspot", timeout=15)
+        args = ["--wait", str(JOIN_WAIT), "device", "wifi", "connect", ssid, "ifname", DEV,
+                "name", JOINING]
+        if password:
+            args += ["password", password]
+        seen, by_name = _wait_to_see(ssid)
+        # Found only when asked for by name - or not at all: it may just not announce
+        # its name, and is joined (and saved) as a hidden network.
+        if by_name or not seen:
+            args += ["hidden", "yes"]
+        # nmcli gives up by itself after JOIN_WAIT; the margin is so that nmcli, not
+        # this helper, is the one to stop a slow join.
+        r = _nmcli(*args, timeout=JOIN_WAIT + 15)
+        joined, detail, out = r.returncode == 0, _scrub(r.stderr, password), r.stdout
+    except subprocess.TimeoutExpired:
+        detail = "the network took too long to answer"
+    except Exception as exc:   # whatever went wrong, the setup network must come back
+        detail = f"the network helper failed ({type(exc).__name__})"
+    if joined:
+        try:
+            # The network this join brought up - and only it: anything an earlier join
+            # left under the same name is removed, never settled in its place.
+            mine = _joined(out) or next((u for n, u, c in _wifi_profiles() if n == JOINING and c), None)
+            _drop_joining(keep=mine)
+            if mine:
+                _settle(mine, ssid)
+        except (RuntimeError, subprocess.TimeoutExpired):
+            pass                  # the next run of this helper settles it (_tidy_joining)
         _nmcli("connection", "delete", "Hotspot", timeout=10)  # don't let the AP come back
-        # Retry forever on reconnect: the default gives up after a few tries, which is
-        # exactly how a sign that booted before its router ends up stranded offline.
-        _nmcli("connection", "modify", ssid, "connection.autoconnect", "yes",
-               "connection.autoconnect-retries", "0", timeout=10)
         _captive_off()   # clean client mode — no redirect left behind
         do_status(req)
     else:
-        _nmcli("connection", "up", "Hotspot", timeout=20)  # restore setup mode to retry
-        _captive_on()    # re-arm the portal so a retry still auto-opens
-        _write(STATUS, {"error": f"could not join {ssid}", "detail": _scrub(r.stderr, password),
-                        "ap_active": True, "when": _now()})
+        try:
+            _drop_joining()
+        except (RuntimeError, subprocess.TimeoutExpired):
+            pass                  # the next run of this helper removes it (_tidy_joining)
+        try:
+            back = _nmcli("connection", "up", "Hotspot", timeout=20).returncode == 0
+        except subprocess.TimeoutExpired:
+            back = False
+        if back:
+            _captive_on()    # re-arm the portal so a retry still auto-opens
+        _write(STATUS, {"error": f"could not join {ssid}", "detail": detail,
+                        "ap_active": back, "when": _now()})
 
 
 def do_stop(req) -> None:
@@ -273,6 +444,9 @@ def main() -> None:
     # Never record an exception's own text: a timed-out join's message is the whole
     # nmcli command line, Wi-Fi password included. Say what kind of failure it was.
     try:
+        global DEV
+        DEV = _wifi_device()
+        _tidy_joining()   # only one helper runs at a time: any JOINING network is a leftover
         fn(req)
     except subprocess.TimeoutExpired:
         _write(STATUS, {"error": "the network took too long to answer",

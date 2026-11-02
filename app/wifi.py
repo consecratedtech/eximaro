@@ -86,7 +86,12 @@ def request_hotspot() -> dict:
 
 
 def request_connect(ssid: str, password: str = "") -> None:
-    """Ask the helper to join a real network (which drops the setup AP)."""
+    """Ask the helper to join a real network (which drops the setup AP). The watcher
+    leaves the radio to the helper while it does: offline for as long as a join takes,
+    it would otherwise ask for the setup network again, and the helper would put it up
+    straight after a join that worked."""
+    global _join_until
+    _join_until = time.monotonic() + JOIN_WINDOW
     _request({"action": "connect", "ssid": ssid, "password": password})
 
 
@@ -139,8 +144,13 @@ SETUP_GRACE = 45  # seconds offline before an UNCONFIGURED device offers setup
 
 PROVISIONED_PATH = config.DATA / "wifi-provisioned"  # set once the device is ever online
 MANUAL_SETUP_WINDOW = 600  # seconds a hand-started setup AP is left alone by the watcher
+# Seconds a join is left to the helper: its waits for the network to show up and for the
+# join itself (helpers/eximaro-wifi, SCAN_WAIT and JOIN_WAIT) plus what it does before
+# and after, with room to spare.
+JOIN_WINDOW = 240
 
 _manual_setup_until = 0.0  # monotonic deadline; module-level, shared with the watcher thread
+_join_until = 0.0          # likewise, while the helper is joining a network
 
 
 def _mark_provisioned() -> None:
@@ -174,7 +184,8 @@ def _decide(real, ap, configured, manual, down_since, now, grace=SETUP_GRACE):
 
       real       - a genuine, non-setup connection is up right now
       configured - a network is already saved / the device has been online before
-      manual     - the operator is running setup by hand right now (leave the AP alone)
+      manual     - setup is in someone's hands right now: a setup network started by
+                   hand, or a join the helper is still making (leave the radio alone)
     """
     if real:
         return ("stop" if ap else None), None      # online: drop any setup AP
@@ -213,7 +224,7 @@ def _watch_loop():
             configured = is_provisioned() or bool(status().get("has_saved"))
             action, down_since = _decide(
                 real, discovery.hosting_ap(), configured,
-                time.monotonic() < _manual_setup_until,
+                time.monotonic() < max(_manual_setup_until, _join_until),
                 down_since, time.monotonic())
             if action == "stop":
                 request_stop()

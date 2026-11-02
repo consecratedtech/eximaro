@@ -107,6 +107,53 @@ def test_decide_online_always_wins_over_manual():
     assert wifi._decide(True, True, True, True, 50, 100) == ("stop", None)
 
 
+class _Stop(BaseException):
+    """Ends the watcher's loop (it carries on through any Exception)."""
+
+
+def _watch(monkeypatch, seconds, clock):
+    """Run the watcher for about `seconds` on a fake clock, offline, never set up and
+    not hosting; returns the times it asked for the setup network."""
+    asked = []
+    def sleep(s):
+        clock["t"] += s
+        if clock["t"] > clock["end"]:
+            raise _Stop()
+    clock["end"] = clock["t"] + seconds
+    monkeypatch.setattr(wifi.time, "sleep", sleep)
+    monkeypatch.setattr(wifi.discovery, "real_ips", lambda: [])
+    monkeypatch.setattr(wifi.discovery, "hosting_ap", lambda: False)
+    monkeypatch.setattr(wifi, "request_status", lambda: None)
+    monkeypatch.setattr(wifi, "request_hotspot", lambda: asked.append(clock["t"]))
+    try:
+        wifi._watch_loop()
+    except _Stop:
+        pass
+    return asked
+
+
+def test_the_watcher_leaves_a_join_to_the_helper(clean_data_dir, monkeypatch):
+    # Offline for as long as a join takes, a screen that was never set up would ask for
+    # the setup network again - and the helper would put it up straight after a join
+    # that worked. A join is left alone for as long as it can take.
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(wifi.time, "monotonic", lambda: clock["t"])
+    wifi.request_connect("Home Net", "pw")
+    wifi.REQUEST_PATH.unlink()                 # the helper has picked the request up
+    assert _watch(monkeypatch, wifi.JOIN_WINDOW - 10, clock) == []
+
+
+def test_after_a_join_window_setup_is_offered_again(clean_data_dir, monkeypatch):
+    # ...but not forever: once the join's time is up and the screen is still offline
+    # and not hosting, it offers the setup network again after the usual grace.
+    clock = {"t": 5000.0}
+    monkeypatch.setattr(wifi.time, "monotonic", lambda: clock["t"])
+    wifi.request_connect("Home Net", "pw")
+    wifi.REQUEST_PATH.unlink()
+    asked = _watch(monkeypatch, wifi.JOIN_WINDOW + wifi.SETUP_GRACE + 30, clock)
+    assert asked and asked[0] >= 5000.0 + wifi.JOIN_WINDOW + wifi.SETUP_GRACE
+
+
 def test_provisioned_flag_roundtrip(clean_data_dir):
     assert not wifi.is_provisioned()
     wifi._mark_provisioned()
