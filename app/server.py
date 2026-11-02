@@ -999,8 +999,11 @@ def create_app() -> FastAPI:
     async def pair_claim(request: Request):
         body = await request.json()
         try:
-            result = pairing.claim(
-                body["code"], body["controller"], body["sealed_site_key"]
+            # Opening the seal takes a slow key derivation: off the event loop, so the
+            # screen's own page never waits on it.
+            result = await run_in_threadpool(
+                pairing.claim, body["controller"], body["sealed_site_key"],
+                code=body.get("code"), client=request.client.host if request.client else "",
             )
         except (KeyError, ValueError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)

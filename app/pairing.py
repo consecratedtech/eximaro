@@ -2,11 +2,13 @@
 # Copyright (C) 2026 Consecrated Tech
 """Pairing: a controller claims a display.
 
-A display shows a short code for a few minutes. The controller sends that code
-back with its identity. The code does two jobs: it proves an operator is present
-at the display, and it derives a key that protects the controller's signing key
-while it crosses the network — so nothing sensitive travels in the clear. Once
-claimed, the display trusts commands signed by that controller's key.
+A display shows a short code for a few minutes. The operator types it on the
+controller, which seals its signing key with a key derived from that code and sends
+it to the display with its identity. The code is not sent along with the seal: the
+display shows it knows the code by opening it. So the code proves an operator is
+present at the display, and a device that gets hold of the claim - one posing as the
+display, say - holds a seal it can't open without the code. Once claimed, the display
+trusts commands signed by that controller's key.
 
 Trust is anchored to the permanent Device ID, so a controller can change its
 name or address later without breaking the paired link.
@@ -17,6 +19,7 @@ import ipaddress
 import re
 import secrets
 import time
+import urllib.error
 import urllib.request
 import json as _json
 
@@ -30,10 +33,13 @@ from .crypto import VAULT_LOCK, Vault
 CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no 0/O/1/I/L to avoid misreads
 CODE_LENGTH = 8
 CODE_TTL = 180  # seconds the code stays valid (matches the on-screen timeout)
+CODE_TRIES = 5  # wrong tries a code takes from any one device before it stops listening to it
+TOO_MANY = "Too many wrong codes from this device."
 _DEVICE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")   # ids are hex; never markup or a path
 
-# Display-side pending code, kept only in memory (never written to disk).
-_pending = {"code": None, "expires": 0.0}
+# Display-side pending code, kept only in memory (never written to disk). `fails` counts
+# wrong tries per device that made them.
+_pending = {"code": None, "expires": 0.0, "fails": {}}
 
 
 # --- code lifecycle (display side) ------------------------------------------
@@ -45,6 +51,7 @@ def new_code() -> str:
 def start_pairing() -> str:
     _pending["code"] = new_code()
     _pending["expires"] = time.time() + CODE_TTL
+    _pending["fails"] = {}
     return _pending["code"]
 
 
@@ -178,11 +185,24 @@ def remove_display(device_id: str) -> None:
 
 # --- the claim (runs ON the display when a controller submits the code) ------
 
-def claim(code: str, controller: dict, sealed_site_key: str) -> dict:
+def claim(controller: dict, sealed_site_key: str, code=None, client: str = "") -> dict:
+    """Take the controller's site key, sealed with the code on screen. Opening the seal
+    is the proof the controller was given that code; a controller from before the code
+    stopped being sent with the key still sends it, and then it must match too. A device
+    (`client`) that has tried a few wrong ones is not listened to again for this code:
+    the code can't be guessed at, and nobody else can use up its tries."""
     valid = current_code()
-    if not valid or code.strip().upper() != valid:
+    if not valid:
         raise ValueError("Invalid or expired code.")
-    site_key = open_with_code(valid, sealed_site_key).decode()
+    if _pending["fails"].get(client, 0) >= CODE_TRIES:
+        raise ValueError(TOO_MANY)
+    try:
+        if code is not None and code.strip().upper() != valid:
+            raise ValueError("wrong code")
+        site_key = open_with_code(valid, sealed_site_key).decode()
+    except Exception:
+        _pending["fails"][client] = _pending["fails"].get(client, 0) + 1
+        raise ValueError("Invalid or expired code.") from None
     set_controller({
         "device_id": controller["device_id"],
         "name": controller.get("name", ""),
@@ -195,19 +215,39 @@ def claim(code: str, controller: dict, sealed_site_key: str) -> dict:
 
 # --- claiming a display (runs ON the controller) ----------------------------
 
+def _claim_refused(exc: urllib.error.HTTPError) -> str:
+    """What to tell the operator when a screen turns a pairing away."""
+    try:
+        said = _json.loads(exc.read().decode()).get("error", "")
+    except Exception:
+        said = ""
+    if said == "'code'":   # a screen from before the code stopped being sent asks for it
+        return ("That screen needs an update before it can be paired: on its own panel, "
+                "open Settings and press Update now under Software, then try again.")
+    if said == TOO_MANY:
+        return ("That screen has stopped taking this code from here after too many wrong "
+                "tries. Start pairing again on the screen for a new code, and enter that one.")
+    return ("The screen didn't take that code. Check the code it shows - each one works "
+            "for 3 minutes - and try again.")
+
+
 def claim_display(address: str, port: int, code: str, controller: dict) -> dict:
-    """Send our identity + the code-sealed site key to the display, and record
-    it once it accepts. Raises on connection/refusal so the UI can report it."""
+    """Send our identity + the site key, sealed with the code, to the display, and
+    record it once it accepts. The code is not sent with the seal, so a device posing
+    as that screen gets a seal it can't open without the code. Raises on
+    connection/refusal so the UI can report it."""
     sealed = seal_with_code(code.strip().upper(), auth.get_or_create_site_key().encode())
     payload = _json.dumps({
-        "code": code.strip().upper(),
         "controller": controller,
         "sealed_site_key": sealed,
     }).encode()
     url = f"http://{address}:{port}/api/pair/claim"
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        result = _json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = _json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        raise ValueError(_claim_refused(exc)) from None
     # Whatever answered at that address wrote this reply, so keep only an id shaped
     # like a real one (device ids are hex) and a name that is plain text.
     device_id = result.get("device_id")
