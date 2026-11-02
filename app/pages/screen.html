@@ -190,7 +190,13 @@
     const pageStart = performance.now();
     const LONE_DECK_REMOUNT_MS = 15 * 60 * 1000;  // how long a bad load can last on a one-deck playlist
     const FAILED_WAIT_MS = 15 * 60 * 1000;  // a video that wouldn't play is left alone this long
+    // The kiosk add-on has recognised a drawn deck on this screen. From then on its
+    // 'unknown' - or no word at all - means a load went wrong; until then, it may simply
+    // not know the page (see playSlidesDeck).
+    let addonProven = false;
+    let held = false;      // a full-screen cover is up over the content (see hold)
     let layers = [];       // mounted layer per item (built once, reused)
+    let leaving = [];      // layers of items the playlist no longer has, still on screen
 
     let cycleTimer = null;   // advances items, and slides WITHIN a pptx slideshow
     let pendingSlide = null; // {iframe, timer}: a Google Slides reload still loading
@@ -246,6 +252,7 @@
           contentReachable = false;
           blocked = null;
           layers.forEach(e => { if (e.page && !reachableNow(e.item)) e.stale = true; });
+          hold(true);
           return;   // setup takes over; skip the address / pairing / content logic
         }
         setupEl.style.display = 'none';
@@ -310,6 +317,7 @@
         if (why) why.textContent = data.content_note
           ? ('Not showing it yet: ' + data.content_note + '. Retrying.')
           : 'This screen starts as soon as it can reach your content.';
+        hold(!!data.pairing_code);
 
         const sig = JSON.stringify({ i: data.items || [], s: !!data.shuffle });
         if (sig !== signature) {
@@ -358,7 +366,9 @@
         el.src = item.src;
       } else {
         el = document.createElement('iframe');
-        el.src = embedSrc(item.src);
+        // A YouTube video is loaded when its turn comes (playYouTube), never before:
+        // loaded here, it would start playing out of sight, with sound if it has any.
+        if (!item.youtube) el.src = embedSrc(item.src);
         el.allow = 'autoplay; fullscreen';
         if (isSlides(item.src)) el.className = 'slides';
       }
@@ -386,12 +396,28 @@
           // can't be reached right now, it is loaded again before it is shown.
           entry.page = item.type === 'url' && !entry.slides && !item.youtube;
           entry.stale = entry.page && !reachableNow(item);
+          // Nor is a page put on screen before it has finished loading for the first
+          // time (see playPage), which would show its blank frame in the meantime.
+          entry.ready = !entry.page;
+          if (entry.page) entry.el.querySelector('iframe').onload = () => { entry.ready = true; };
           stage.appendChild(entry.el);
         }
         next.push(entry);
       }
       for (const old of layers) {
-        if (!next.includes(old) && old.el.parentNode) old.el.parentNode.removeChild(old.el);
+        if (next.includes(old) || !old.el.parentNode) continue;
+        // The item on screen stays there until whatever follows it is up, so an edit
+        // to the playlist never shows a black stage while the next item loads. It is no
+        // longer played, though: it stops where it is, sound and all, and a video's
+        // ending must not move the new playlist on. Under a full-screen cover it isn't on
+        // screen, and simply goes.
+        if (old.el.classList.contains('active') && !covered()) {
+          const v = old.el.querySelector('video');
+          if (v) { v.onended = null; v.onerror = null; v.onloadedmetadata = null; try { v.pause(); } catch (_) {} }
+          const f = old.item && old.item.youtube ? old.el.querySelector('iframe') : null;
+          if (f) ytCmd(f, 'pauseVideo');
+          leaving.push(old.el);
+        } else old.el.parentNode.removeChild(old.el);
       }
       layers = next;
     }
@@ -424,6 +450,14 @@
         if (e.item && e.item.youtube) {
           const f = e.el.querySelector('iframe');
           if (f) ytCmd(f, 'pauseVideo');
+          // A player that hasn't answered on this load never hears that pause: it would
+          // come up later and play on out of sight, with sound if it has any. Its frame
+          // is emptied instead - once it is off screen (see revealLayer, showCard). Its
+          // next turn loads it afresh anyway.
+          if (f && !e.ytAlive && f.src && f.src !== 'about:blank') {
+            if (e.el.classList.contains('active') && !covered()) e.unload = true;
+            else unloadFrame(e);
+          }
         }
       });
     }
@@ -457,15 +491,56 @@
       if (e && e.failedAt && performance.now() - e.failedAt < FAILED_WAIT_MS) return false;
       return reachableNow(it);
     }
-    // Put item idx on screen. This is also what takes the waiting card down, so going
-    // from the card to an item that is still loading shows neither a black stage nor
-    // what was on screen before the card.
+    // Put item idx on screen. This is also what takes the waiting card, the startup
+    // screen and the set-up screen down, so going from any of them to an item that is
+    // still loading shows neither a black stage nor what was on screen before.
     function revealLayer(idx) {
       layers.forEach((e, n) => {
         e.el.classList.toggle('active', n === idx);
         if (n !== idx && e.unload) unloadFrame(e);
       });
       netwait.style.display = 'none';
+      coversOff();
+      dropLeaving(true);
+    }
+    // The waiting card, in place of whatever was showing - and over a YouTube frame
+    // waiting to be emptied, which can be emptied now.
+    function showCard() {
+      netwait.style.display = 'flex';
+      coversOff();
+      dropLeaving(false);
+      layers.forEach(e => { if (e.unload) unloadFrame(e); });
+    }
+    // The startup screen, and the set-up screen once something is set up, stay up until
+    // what follows them is: an item, or the waiting card (see endBoot and playCurrent).
+    function coversOff() {
+      document.getElementById('boot').style.display = 'none';
+      idle.style.display = 'none';
+    }
+    // Is a full-screen cover up - the waiting card, a pairing code, the Wi-Fi setup
+    // screen - so that nothing under it is on screen?
+    function covered() {
+      return netwait.style.display === 'flex' || pair.style.display === 'flex'
+          || document.getElementById('wifisetup').style.display === 'flex';
+    }
+    // The Wi-Fi setup screen or a pairing code over the content: what played under it is
+    // stopped - it would play on unseen, with sound if it has any - and the playlist
+    // takes up again when the cover goes.
+    function hold(on) {
+      if (on === held) return;
+      held = on;
+      if (on) clearTimers();
+      else playCurrent();
+    }
+    // Take down what the playlist no longer has: straight away when a full screen goes
+    // up over it, or by fading out as the item that replaces it fades in.
+    function dropLeaving(fade) {
+      const els = leaving;
+      leaving = [];
+      const drop = () => els.forEach(el => { if (el.parentNode) el.parentNode.removeChild(el); });
+      if (!fade) { drop(); return; }
+      els.forEach(el => el.classList.remove('active'));
+      setTimeout(drop, 500);
     }
     // Empty the frame of a YouTube video the screen gave up on. Pausing it isn't enough:
     // a player that comes up late never heard the pause, and would play on out of sight,
@@ -485,14 +560,15 @@
     // before we move on — never cut off mid-deck.
     function playCurrent() {
       clearTimers();
-      if (!bootDone) return;                       // boot splash owns the screen first
+      if (!bootDone || held) return;               // boot splash owns the screen first; see hold
       if (!items.length) {                         // nothing to play → idle/setup screen
-        idle.style.display = 'flex';
         netwait.style.display = 'none';            // nothing to wait for: the set-up screen shows
         layers.forEach(e => e.el.classList.remove('active'));
+        coversOff();
+        idle.style.display = 'flex';
+        dropLeaving(false);
         return;
       }
-      idle.style.display = 'none';
       const idx = order[pos % order.length];
       const item = items[idx];
       const single = items.length === 1;
@@ -504,7 +580,7 @@
       // up. Prefer content we can actually show; otherwise wait and retry.
       if (!canShow(item, idx)) {
         if (items.some(canShow)) { advance(); return; }             // something else can be shown
-        netwait.style.display = 'flex';
+        showCard();
         layers.forEach(e => e.el.classList.remove('active'));
         cycleTimer = setTimeout(playCurrent, 4000);                   // cleared by clearTimers
         return;
@@ -526,17 +602,17 @@
 
     // A web page: show it, and move on after its time. One that couldn't be reached
     // since it was last loaded may be holding Chromium's error page, so it is loaded
-    // again first; the previous layer stays up until it has.
+    // again first; one that is still loading for the first time is waited for. Either
+    // way the previous layer stays up until it has loaded.
     function playPage(idx, single) {
       const entry = layers[idx];
       const show = () => { revealLayer(idx); if (!single) cycleTimer = setTimeout(advance, dur(entry.item)); };
-      const iframe = entry.stale ? entry.el.querySelector('iframe') : null;
+      const iframe = (entry.stale || !entry.ready) ? entry.el.querySelector('iframe') : null;
       if (!iframe) { show(); return; }
-      entry.stale = false;
       let done = false;
-      const go = () => { if (done) return; done = true; clearPendingSlide(); show(); };
+      const go = () => { if (done) return; done = true; entry.ready = true; clearPendingSlide(); show(); };
       iframe.onload = go;
-      iframe.src = entry.src;
+      if (entry.stale) { entry.stale = false; iframe.src = entry.src; }
       pendingSlide = { iframe, timer: setTimeout(go, 3500) };  // fail-safe if onload never fires
     }
 
@@ -547,7 +623,11 @@
       const item = entry.item;
       const img = entry.el.querySelector('img');
       const srcs = item.srcs || [];
-      if (!srcs.length) { if (!single) advance(); return; }
+      if (!srcs.length) {
+        if (!single) { advance(); return; }
+        coversOff(); dropLeaving(false);
+        return;
+      }
       let s = 0;
       const step = () => {
         img.src = srcs[s];
@@ -673,6 +753,7 @@
       entry.ytAlive = false;
       entry.ytCcDone = false;
       entry.ytWaiting = false;
+      entry.ytLoaded = false;   // this load's page is up; until then, any answer is the last one's
       entry.unload = false;
       // It was silent last time: show it only once its player answers. Until then it is
       // tried behind another item that is on screen and can be shown, or else under the
@@ -682,7 +763,7 @@
       if (retry && !layers.some((e, i) => i !== idx && e.el.classList.contains('active')
                                        && canShow(e.item, i))) {
         entry.ytWaiting = true;
-        netwait.style.display = 'flex';
+        showCard();
       }
       // A lone video loops seamlessly via YouTube's own loop (no API round-trip), so
       // it can't get stuck on the end screen if a message is missed. A video in a
@@ -698,6 +779,7 @@
       const go = () => {
         if (shown) return;
         shown = true;
+        entry.ytLoaded = true;
         clearPendingSlide();
         if (!retry) revealLayer(idx);
         ytHandshake(iframe, entry);
@@ -723,7 +805,7 @@
           return;
         }
         entry.ytWaiting = true;
-        netwait.style.display = 'flex';
+        showCard();
         const wait = () => {
           if (items.some(canShow)) { advance(); return; }   // something else - or this one again
           cycleTimer = setTimeout(wait, 4000);
@@ -748,9 +830,11 @@
       ytBeat = setInterval(() => {
         if (entry.ytAlive || !iframe.isConnected) { clearInterval(ytBeat); ytBeat = null; return; }
         // Every 0.6 s for the 12 s a player has to answer in, then every 3 s, so a player
-        // that is slow to start still hears it in time and can say it is playing.
+        // that is slow to start still hears it in time and can say it is playing - and
+        // every 0.6 s again while the waiting card is up for it, so that it takes the card
+        // down as soon as it plays.
         tries += 1;
-        if (tries <= 20 || tries % 5 === 0) ytListen(iframe);
+        if (tries <= 20 || tries % 5 === 0 || entry.ytWaiting) ytListen(iframe);
       }, 600);
     }
 
@@ -766,6 +850,9 @@
       if (!entry || !entry.item || !entry.item.youtube) return;
       const iframe = entry.el.querySelector('iframe');
       if (!iframe || ev.source !== iframe.contentWindow) return;
+      // A frame reloaded for a new turn holds the old page until the new one arrives, and
+      // the old player still answers - its words are not this load's.
+      if (!entry.ytLoaded) return;
       entry.ytAlive = true;                           // the player is answering — it's really playing
       if (entry.failedAt || entry.ytWaiting) {        // a slow or once-silent player answered: show it
         entry.failedAt = 0;
@@ -811,12 +898,12 @@
     // while (see loadData). Opened deliberately from the panel ("Open full-screen
     // view") it is pointless -- you are already on the panel, looking at this device --
     // and a full minute of splash just reads as the preview being broken. ?preview
-    // goes straight to it.
+    // goes straight to it. The startup screen itself stays up until the first item has
+    // loaded (see revealLayer), so the change to content never goes through black.
     function endBoot() {
       if (bootDone) return;
       bootDone = true;
       clearTimeout(bootTimer);
-      document.getElementById('boot').style.display = 'none';
       playCurrent();
     }
     if (new URLSearchParams(location.search).has('preview')) endBoot();
